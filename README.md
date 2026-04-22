@@ -5,7 +5,7 @@ With this design, Lngram achieves stronger performance while naturally supportin
 
 The paper is available at .
 
-![Lngram Overview]([assets](main/lngram.png)
+![Lngram Overview]([assets]([main/lngram.png](https://github.com/zyaaa-ux/Lngram/blob/main/lngram.png))
 
 
 
