@@ -18,7 +18,7 @@ Because standard Transformers lack a native lookup primitive, such retrieval can
 For example, to recognize a common multi-token entity, the model often has to gradually aggregate local context and complete the match in the early layers.
 Functionally, this process is closer to table lookup than to deep reasoning, and therefore consumes effective depth that could otherwise be used for subsequent compositional computation, ultimately affecting the model’s reasoning performance.
 
-To separate this type of static retrieval from backbone computation, \citet{cheng2026engram} explored an alternative called Engram.
+To separate this type of static retrieval from backbone computation, DeepSeek explored an alternative called Engram.
 Engram performs local suffix N-gram retrieval at designated layers: it first compresses tokenizer outputs into normalized identifiers, then maps them through deterministic multi-head hashing to several embedding tables, retrieves static vectors, and fuses them with the current hidden states through context-dependent gating and lightweight convolutions.
 However, our investigation suggests that in such methods the retrieval keys are still constructed entirely from tokenizer IDs, so the matching boundaries remain constrained by the tokenizer’s segmentation scheme.
 Meanwhile, because the combinatorial space of N-grams grows rapidly with vocabulary size and order, practical implementations can only rely on hash-based compression to map a large number of patterns to a limited number of table entries, making collisions unavoidable.
