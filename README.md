@@ -1,4 +1,4 @@
-## Abstract
+## 	Lngram: N-gram Conditional Memory in Latent Space 
 
 Lngram upgrades Engram from modeling on **tokenizer IDs** to modeling on **hidden-state IDs**.  
 With this design, Lngram achieves stronger performance while naturally supporting deployment on models beyond the language domain, including models in other modalities.
