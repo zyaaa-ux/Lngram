@@ -1,0 +1,1907 @@
+from __future__ import annotations
+import warnings
+from dataclasses import dataclass
+from typing import Iterable, Optional, Sequence, Tuple
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+from torch import nn
+
+
+def _canonical_surrogate_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower().replace("-", "_")
+    if normalized in {"exact", "exact_local", "local_expectation"}:
+        return "exact"
+    if normalized in {"approx", "approximate", "bitflip", "bit_flip", "one_bit"}:
+        return "approximate"
+    raise ValueError(f"Unknown surrogate mode {mode!r}. Use 'exact' or 'approximate'.")
+
+
+def _canonical_execution_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in {"full", "streaming", "auto"}:
+        raise ValueError(
+            f"Unknown execution mode {mode!r}. Use 'full', 'streaming', or 'auto'."
+        )
+    return normalized
+
+
+@dataclass(frozen=True)
+class LngramConfig:
+    enabled: bool
+    target_layers: Tuple[int, ...]
+    bits_per_route: int
+    ngrams: Tuple[int, ...]
+    memory_dim: int
+    dropout: float
+    q_proj_init_std_scale: float
+    table_init_mode: str
+    table_init_std_scale: float
+    readout_num_heads: int
+    readout_num_kv_heads: int
+    readout_head_dim: int
+    readout_attention_dropout: float
+    readout_proj_bias: bool
+    readout_use_sdpa: bool
+    readout_online_accum_fp32: bool
+    readout_checkpoint_streaming: bool
+    readout_auto_max_kv_mb: float
+    readout_q_proj_init_std_scale: float
+    readout_kv_proj_init_std_scale: float
+    output_proj_init_std_scale: float
+    q_surrogate_enable: bool
+    q_surrogate_mode: str
+    q_surrogate_training_only: bool
+    q_surrogate_temp: float
+    q_surrogate_scale: float
+    q_surrogate_route_chunk_size: int
+    q_surrogate_accum_fp32: bool
+    exact_code_chunk_size: int
+    approx_counterfactual_chunk_size: int
+    approx_reuse_forward_memory: bool
+    approx_use_int32_indices: bool
+    execution_mode: str
+    stream_route_chunk_size: int
+    proj_chunk_size: Optional[int]
+    use_fused_rmsnorm: bool
+    conv_kernel_size: int
+    conv_dilation: Optional[int]
+    conv_bias: bool
+    conv_zero_init: bool
+    table_lr_multiplier: float
+    table_weight_decay: float
+
+    def validate(
+        self, hidden_size: int, num_hidden_layers: Optional[int] = None
+    ) -> None:
+        bits_per_route = int(self.bits_per_route)
+        if bits_per_route <= 0:
+            raise ValueError(f"bits_per_route must be > 0, got {bits_per_route}.")
+        if bits_per_route > 16:
+            raise ValueError(
+                "bits_per_route > 16 is intentionally rejected because the exact counterfactual code space and n-gram tables become impractically large."
+            )
+        if hidden_size % bits_per_route != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} must be divisible by bits_per_route={bits_per_route}."
+            )
+        if int(self.memory_dim) <= 0:
+            raise ValueError(f"memory_dim must be > 0, got {self.memory_dim}.")
+        if not self.ngrams:
+            raise ValueError("ngrams must not be empty.")
+        if any((int(n) < 1 for n in self.ngrams)):
+            raise ValueError(f"All n-gram orders must be >= 1, got {self.ngrams}.")
+        if not 0.0 <= float(self.dropout) < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}.")
+        if str(self.table_init_mode).strip().lower() not in {"zeros", "normal"}:
+            raise ValueError(
+                f"table_init_mode must be 'zeros' or 'normal', got {self.table_init_mode!r}."
+            )
+        if int(self.readout_num_heads) <= 0:
+            raise ValueError("readout_num_heads must be > 0.")
+        if int(self.readout_num_kv_heads) <= 0:
+            raise ValueError("readout_num_kv_heads must be > 0.")
+        if int(self.readout_num_heads) % int(self.readout_num_kv_heads) != 0:
+            raise ValueError(
+                f"readout_num_heads={self.readout_num_heads} must be divisible by readout_num_kv_heads={self.readout_num_kv_heads}."
+            )
+        if int(self.readout_head_dim) <= 0:
+            raise ValueError("readout_head_dim must be > 0.")
+        if not 0.0 <= float(self.readout_attention_dropout) < 1.0:
+            raise ValueError("readout_attention_dropout must be in [0, 1).")
+        if float(self.readout_auto_max_kv_mb) <= 0.0:
+            raise ValueError("readout_auto_max_kv_mb must be > 0.")
+        _canonical_surrogate_mode(self.q_surrogate_mode)
+        _canonical_execution_mode(self.execution_mode)
+        if float(self.q_surrogate_temp) < 0.0:
+            raise ValueError(
+                f"q_surrogate_temp must be >= 0, got {self.q_surrogate_temp}."
+            )
+        if int(self.q_surrogate_route_chunk_size) <= 0:
+            raise ValueError("q_surrogate_route_chunk_size must be > 0.")
+        if int(self.exact_code_chunk_size) <= 0:
+            raise ValueError("exact_code_chunk_size must be > 0.")
+        if int(self.approx_counterfactual_chunk_size) <= 0:
+            raise ValueError("approx_counterfactual_chunk_size must be > 0.")
+        if int(self.stream_route_chunk_size) <= 0:
+            raise ValueError("stream_route_chunk_size must be > 0.")
+        if self.proj_chunk_size is not None and int(self.proj_chunk_size) <= 0:
+            raise ValueError("proj_chunk_size must be None or > 0.")
+        if int(self.conv_kernel_size) <= 0:
+            raise ValueError("conv_kernel_size must be > 0.")
+        if self.conv_dilation is not None and int(self.conv_dilation) <= 0:
+            raise ValueError("conv_dilation must be None or > 0.")
+        if num_hidden_layers is not None:
+            invalid = [
+                int(idx)
+                for idx in self.target_layers
+                if not 0 <= int(idx) < int(num_hidden_layers)
+            ]
+            if invalid:
+                raise ValueError(
+                    f"target_layers contains out-of-range indices {invalid} for num_hidden_layers={num_hidden_layers}."
+                )
+
+
+def build_lngram_config(config) -> LngramConfig:
+    return LngramConfig(
+        enabled=bool(config.lngram_enabled),
+        target_layers=tuple((int(index) for index in config.lngram_layers)),
+        bits_per_route=int(config.lngram_bits_per_route),
+        ngrams=tuple((int(order) for order in config.lngram_ngrams)),
+        memory_dim=int(config.lngram_memory_dim),
+        dropout=float(config.lngram_dropout),
+        q_proj_init_std_scale=float(config.lngram_q_proj_init_std_scale),
+        table_init_mode=str(config.lngram_table_init_mode),
+        table_init_std_scale=float(config.lngram_table_init_std_scale),
+        readout_num_heads=int(config.lngram_readout_num_heads),
+        readout_num_kv_heads=int(config.lngram_readout_num_kv_heads),
+        readout_head_dim=int(config.lngram_readout_head_dim),
+        readout_attention_dropout=float(config.lngram_readout_attention_dropout),
+        readout_proj_bias=bool(config.lngram_readout_proj_bias),
+        readout_use_sdpa=bool(config.lngram_readout_use_sdpa),
+        readout_online_accum_fp32=bool(config.lngram_readout_online_accum_fp32),
+        readout_checkpoint_streaming=bool(config.lngram_readout_checkpoint_streaming),
+        readout_auto_max_kv_mb=float(config.lngram_readout_auto_max_kv_mb),
+        readout_q_proj_init_std_scale=float(
+            config.lngram_readout_q_proj_init_std_scale
+        ),
+        readout_kv_proj_init_std_scale=float(
+            config.lngram_readout_kv_proj_init_std_scale
+        ),
+        output_proj_init_std_scale=float(config.lngram_output_proj_init_std_scale),
+        q_surrogate_enable=bool(config.lngram_surrogate_enable),
+        q_surrogate_mode=str(config.lngram_surrogate_mode),
+        q_surrogate_training_only=bool(config.lngram_surrogate_training_only),
+        q_surrogate_temp=float(config.lngram_surrogate_temperature),
+        q_surrogate_scale=float(config.lngram_surrogate_scale),
+        q_surrogate_route_chunk_size=int(config.lngram_surrogate_route_chunk_size),
+        q_surrogate_accum_fp32=bool(config.lngram_surrogate_accum_fp32),
+        exact_code_chunk_size=int(config.lngram_exact_code_chunk_size),
+        approx_counterfactual_chunk_size=int(
+            config.lngram_approx_counterfactual_chunk_size
+        ),
+        approx_reuse_forward_memory=bool(config.lngram_approx_reuse_forward_memory),
+        approx_use_int32_indices=bool(config.lngram_approx_use_int32_indices),
+        execution_mode=str(config.lngram_execution_mode),
+        stream_route_chunk_size=int(config.lngram_stream_route_chunk_size),
+        proj_chunk_size=config.lngram_proj_chunk_size,
+        use_fused_rmsnorm=bool(config.lngram_use_fused_rmsnorm),
+        conv_kernel_size=int(config.lngram_conv_kernel_size),
+        conv_dilation=config.lngram_conv_dilation,
+        conv_bias=bool(config.lngram_conv_bias),
+        conv_zero_init=bool(config.lngram_conv_zero_init),
+        table_lr_multiplier=float(config.lngram_table_lr_multiplier),
+        table_weight_decay=float(config.lngram_table_weight_decay),
+    )
+
+
+def resolve_initializer_std(config) -> float:
+    std = float(config.initializer_range)
+    if std <= 0.0:
+        raise ValueError("initializer_range must be greater than zero.")
+    return std
+
+
+@torch.no_grad()
+def init_linear_weight_(weight: torch.Tensor, std: float) -> None:
+    std = float(std)
+    if std < 0.0:
+        raise ValueError(f"Linear init std must be >= 0, got {std}.")
+    if std == 0.0:
+        weight.zero_()
+        return
+    if weight.dtype == torch.float32:
+        nn.init.normal_(weight, mean=0.0, std=std)
+        return
+    tmp = torch.empty_like(weight, dtype=torch.float32)
+    nn.init.normal_(tmp, mean=0.0, std=std)
+    weight.copy_(tmp.to(dtype=weight.dtype))
+
+
+@torch.no_grad()
+def init_embedding_weight_(weight: torch.Tensor, mode: str, std: float) -> None:
+    mode = str(mode).strip().lower()
+    std = float(std)
+    if mode == "zeros":
+        weight.zero_()
+        return
+    if mode != "normal":
+        raise ValueError(f"Unknown table_init_mode: {mode}.")
+    if std < 0.0:
+        raise ValueError(f"Embedding init std must be >= 0, got {std}.")
+    if std == 0.0:
+        weight.zero_()
+        return
+    if weight.dtype == torch.float32:
+        nn.init.normal_(weight, mean=0.0, std=std)
+        return
+    tmp = torch.empty_like(weight, dtype=torch.float32)
+    nn.init.normal_(tmp, mean=0.0, std=std)
+    weight.copy_(tmp.to(dtype=weight.dtype))
+
+
+def pack_bits_to_route_codes(
+    bits_btc: torch.Tensor, bits_per_route: int
+) -> torch.Tensor:
+    if bits_btc.dim() != 3:
+        raise ValueError(f"bits_btc must be [B, T, C], got {tuple(bits_btc.shape)}.")
+    batch, time, channels = bits_btc.shape
+    bits_per_route = int(bits_per_route)
+    if bits_per_route <= 0 or channels % bits_per_route != 0:
+        raise ValueError(
+            f"channels={channels} must be divisible by positive bits_per_route={bits_per_route}."
+        )
+    if bits_per_route > 30:
+        raise ValueError("bits_per_route > 30 is not supported by the int32 packer.")
+    num_routes = channels // bits_per_route
+    grouped = bits_btc.reshape(batch, time, num_routes, bits_per_route).to(torch.int32)
+    positions = torch.arange(bits_per_route, device=bits_btc.device, dtype=torch.int32)
+    weights = torch.bitwise_left_shift(torch.ones_like(positions), positions)
+    return torch.sum(grouped * weights.view(1, 1, 1, -1), dim=-1, dtype=torch.int32)
+
+
+def chunked_linear_lastdim(
+    x: torch.Tensor, linear: nn.Linear, chunk_size: Optional[int]
+) -> torch.Tensor:
+    if x.dim() < 2:
+        raise ValueError(f"x must have dim >= 2, got shape={tuple(x.shape)}.")
+    in_features = int(linear.in_features)
+    out_features = int(linear.out_features)
+    if x.shape[-1] != in_features:
+        raise ValueError(
+            f"Input last dim mismatch: got {x.shape[-1]}, expected {in_features}."
+        )
+    if chunk_size is None:
+        return F.linear(x, linear.weight, linear.bias)
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0 or chunk_size >= in_features:
+        return F.linear(x, linear.weight, linear.bias)
+    prefix_shape = x.shape[:-1]
+    x2d = x.reshape(-1, in_features)
+    out: Optional[torch.Tensor] = None
+    for start in range(0, in_features, chunk_size):
+        end = min(in_features, start + chunk_size)
+        part = F.linear(x2d[:, start:end], linear.weight[:, start:end], bias=None)
+        out = part if out is None else out + part
+    if out is None:
+        raise RuntimeError("No projection chunk was produced.")
+    if linear.bias is not None:
+        out = out + linear.bias
+    return out.view(*prefix_shape, out_features)
+
+
+class RMSNorm(nn.Module):
+
+    def __init__(
+        self, hidden_size: int, eps: float, use_fused: bool, device=None, dtype=None
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.variance_epsilon = float(eps)
+        self.use_fused = bool(use_fused)
+        self.weight = nn.Parameter(
+            torch.ones(self.hidden_size, device=device, dtype=dtype)
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_fused and hasattr(F, "rms_norm"):
+            return F.rms_norm(
+                hidden_states, (self.hidden_size,), self.weight, self.variance_epsilon
+            )
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        variance = x.square().mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * x.to(input_dtype)
+
+
+class DepthwiseCausalConv(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_branches: int,
+        kernel_size: int,
+        dilation: int,
+        eps: float,
+        bias: bool,
+        zero_init: bool,
+        use_fused_rmsnorm: bool,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.num_branches = int(num_branches)
+        self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
+        self.left_padding = (self.kernel_size - 1) * self.dilation
+        channels = self.hidden_size * self.num_branches
+        self.conv = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=self.kernel_size,
+            groups=channels,
+            padding=0,
+            dilation=self.dilation,
+            bias=bool(bias),
+            device=device,
+            dtype=dtype,
+        )
+        self.act = nn.SiLU()
+        self.norms = nn.ModuleList(
+            [
+                RMSNorm(
+                    self.hidden_size,
+                    eps=eps,
+                    use_fused=use_fused_rmsnorm,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(self.num_branches)
+            ]
+        )
+        if zero_init:
+            nn.init.zeros_(self.conv.weight)
+            if self.conv.bias is not None:
+                nn.init.zeros_(self.conv.bias)
+
+    def _normalize_and_flatten(self, x: torch.Tensor) -> torch.Tensor:
+        if self.num_branches == 1:
+            return self.norms[0](x[:, :, 0, :])
+        normalized = [
+            self.norms[idx](x[:, :, idx, :]) for idx in range(self.num_branches)
+        ]
+        return torch.cat(normalized, dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(
+                f"DepthwiseCausalConv expects [B, T, M, D], got {tuple(x.shape)}."
+            )
+        batch, _, num_branches, hidden_size = x.shape
+        if num_branches != self.num_branches or hidden_size != self.hidden_size:
+            raise ValueError(
+                f"Shape mismatch: got M={num_branches}, D={hidden_size}; expected M={self.num_branches}, D={self.hidden_size}."
+            )
+        x_cat = self._normalize_and_flatten(x).transpose(1, 2)
+        if self.left_padding > 0:
+            x_cat = F.pad(x_cat, (self.left_padding, 0))
+        y = F.conv1d(
+            x_cat,
+            self.conv.weight,
+            self.conv.bias,
+            stride=1,
+            padding=0,
+            dilation=self.dilation,
+            groups=self.conv.groups,
+        )
+        y = self.act(y).transpose(1, 2)
+        return y.reshape(batch, -1, self.num_branches, self.hidden_size)
+
+    def forward_step(
+        self, x: torch.Tensor, normalized_history: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x.dim() != 4 or x.shape[1] != 1:
+            raise ValueError(
+                f"forward_step expects [B, 1, M, D], got {tuple(x.shape)}."
+            )
+        batch = x.shape[0]
+        x_now = self._normalize_and_flatten(x).transpose(1, 2)
+        channels = x_now.shape[1]
+        if self.left_padding == 0:
+            window = x_now
+            new_history = x_now[:, :, :0]
+        else:
+            if normalized_history is None:
+                normalized_history = torch.zeros(
+                    (batch, channels, self.left_padding), device=x.device, dtype=x.dtype
+                )
+            expected = (batch, channels, self.left_padding)
+            if tuple(normalized_history.shape) != expected:
+                raise ValueError(
+                    f"normalized_history shape={tuple(normalized_history.shape)}, expected {expected}."
+                )
+            window = torch.cat((normalized_history, x_now), dim=-1)
+            new_history = window[:, :, -self.left_padding :]
+        y = F.conv1d(
+            window,
+            self.conv.weight,
+            self.conv.bias,
+            stride=1,
+            padding=0,
+            dilation=self.dilation,
+            groups=self.conv.groups,
+        )
+        y = self.act(y).transpose(1, 2)
+        return (y.reshape(batch, 1, self.num_branches, self.hidden_size), new_history)
+
+
+@dataclass
+class _SurrogateOrderContext:
+    ngram_order: int
+    valid_length: int
+    address: torch.Tensor
+    route_offsets: torch.Tensor
+    table_weight: torch.Tensor
+    grad_valid: torch.Tensor
+    current_memory_valid: Optional[torch.Tensor] = None
+
+
+def _build_ngram_address(
+    route_codes_btr: torch.Tensor, ngram_order: int, alphabet_size: int
+) -> torch.Tensor:
+    if route_codes_btr.dtype not in {torch.int32, torch.int64}:
+        raise TypeError(
+            f"route_codes_btr must use int32 or int64 indices, got {route_codes_btr.dtype}."
+        )
+    batch, time, num_routes = route_codes_btr.shape
+    valid_length = time - int(ngram_order) + 1
+    if valid_length <= 0:
+        return torch.empty(
+            (batch, 0, num_routes),
+            dtype=route_codes_btr.dtype,
+            device=route_codes_btr.device,
+        )
+    address = route_codes_btr[:, :valid_length, :].clone()
+    stride = int(alphabet_size)
+    for exp in range(1, int(ngram_order)):
+        address.add_(route_codes_btr[:, exp : exp + valid_length, :], alpha=stride)
+        stride *= int(alphabet_size)
+    return address
+
+
+def _build_surrogate_contexts(
+    memory: "RouteNgramMemory",
+    q_codes_chunk_index: torch.Tensor,
+    order_gradients: Sequence[Tuple[int, torch.Tensor]],
+    route_start: int,
+    accum_dtype: torch.dtype,
+    order_current_memories: Optional[Sequence[Tuple[int, torch.Tensor]]] = None,
+) -> list[_SurrogateOrderContext]:
+    batch, time, route_count = q_codes_chunk_index.shape
+    contexts: list[_SurrogateOrderContext] = []
+    current_memory_by_order = (
+        {}
+        if order_current_memories is None
+        else {int(order): tensor for order, tensor in order_current_memories}
+    )
+    for ngram_order, grad_memory_full in order_gradients:
+        ngram_order = int(ngram_order)
+        valid_length = time - ngram_order + 1
+        if valid_length <= 0:
+            continue
+        expected_shape = (batch, time, route_count, memory.mem_dim)
+        if tuple(grad_memory_full.shape) != expected_shape:
+            raise ValueError(
+                f"Gradient shape for ngram={ngram_order} is {tuple(grad_memory_full.shape)}, expected {expected_shape}."
+            )
+        address = _build_ngram_address(
+            q_codes_chunk_index,
+            ngram_order=ngram_order,
+            alphabet_size=memory.alphabet_size,
+        )
+        route_offsets = memory._route_offsets_for_order(
+            ngram_order, dtype=q_codes_chunk_index.dtype
+        )[route_start : route_start + route_count].view(1, 1, route_count)
+        grad_valid = grad_memory_full[:, ngram_order - 1 :, :, :]
+        if grad_valid.dtype != accum_dtype:
+            grad_valid = grad_valid.to(accum_dtype)
+        current_memory_valid: Optional[torch.Tensor] = None
+        current_memory_full = current_memory_by_order.get(ngram_order)
+        if current_memory_full is not None:
+            if tuple(current_memory_full.shape) != expected_shape:
+                raise ValueError(
+                    f"Current-memory shape for ngram={ngram_order} is {tuple(current_memory_full.shape)}, expected {expected_shape}."
+                )
+            current_memory_valid = current_memory_full[:, ngram_order - 1 :, :, :]
+            if current_memory_valid.dtype != accum_dtype:
+                current_memory_valid = current_memory_valid.to(accum_dtype)
+        contexts.append(
+            _SurrogateOrderContext(
+                ngram_order=ngram_order,
+                valid_length=valid_length,
+                address=address,
+                route_offsets=route_offsets,
+                table_weight=memory.tables[f"ngram_{ngram_order}"].weight.detach(),
+                grad_valid=grad_valid,
+                current_memory_valid=current_memory_valid,
+            )
+        )
+    return contexts
+
+
+def _exact_surrogate_grad_chunk(
+    memory: "RouteNgramMemory",
+    q_logits_chunk: torch.Tensor,
+    q_codes_chunk_long: torch.Tensor,
+    order_gradients: Sequence[Tuple[int, torch.Tensor]],
+    route_start: int,
+    accum_dtype: torch.dtype,
+) -> torch.Tensor:
+    if q_codes_chunk_long.dtype != torch.long:
+        raise TypeError("Exact surrogate requires int64 route-code indices.")
+    _, _, _, bits_per_route = q_logits_chunk.shape
+    temp = float(memory.q_surrogate_temp)
+    scale = float(memory.q_surrogate_scale)
+    logits_acc = q_logits_chunk.to(accum_dtype)
+    p_all = torch.sigmoid(temp * logits_acc)
+    one_minus_p_all = 1.0 - p_all
+    grad_q = torch.zeros_like(p_all, dtype=accum_dtype)
+    contexts = _build_surrogate_contexts(
+        memory=memory,
+        q_codes_chunk_index=q_codes_chunk_long,
+        order_gradients=order_gradients,
+        route_start=route_start,
+        accum_dtype=accum_dtype,
+    )
+    if not contexts or temp == 0.0 or scale == 0.0:
+        return grad_q
+    code_chunk_size = min(int(memory.exact_code_chunk_size), int(memory.alphabet_size))
+    code_bits_bool = memory._code_bits_bool
+    code_ids = memory._code_ids
+    scaled_temp = scale * temp
+    for code_start in range(0, memory.alphabet_size, code_chunk_size):
+        code_end = min(memory.alphabet_size, code_start + code_chunk_size)
+        num_codes = code_end - code_start
+        bits_bool = code_bits_bool[code_start:code_end]
+        bits_acc = bits_bool.to(accum_dtype)
+        probability_all_times = torch.where(
+            bits_bool.view(1, 1, 1, num_codes, bits_per_route),
+            p_all.unsqueeze(-2),
+            one_minus_p_all.unsqueeze(-2),
+        ).prod(dim=-1)
+        code_ids_chunk = code_ids[code_start:code_end].view(1, 1, 1, num_codes)
+        for context in contexts:
+            stride = 1
+            for exp in range(context.ngram_order):
+                t_lo = exp
+                t_hi = exp + context.valid_length
+                current_codes = q_codes_chunk_long[:, t_lo:t_hi, :]
+                base_index = (
+                    context.route_offsets
+                    + context.address
+                    - current_codes * int(stride)
+                )
+                indices = base_index.unsqueeze(-1) + code_ids_chunk * int(stride)
+                embedding = F.embedding(indices, context.table_weight)
+                if embedding.dtype != accum_dtype:
+                    embedding = embedding.to(accum_dtype)
+                dot = (embedding * context.grad_valid.unsqueeze(-2)).sum(dim=-1)
+                weighted = probability_all_times[:, t_lo:t_hi, :, :] * dot
+                weighted_bits = torch.matmul(weighted, bits_acc)
+                weighted_sum = weighted.sum(dim=-1, keepdim=True)
+                local_score = weighted_bits - weighted_sum * p_all[:, t_lo:t_hi, :, :]
+                grad_q[:, t_lo:t_hi, :, :].add_(local_score, alpha=scaled_temp)
+                stride *= memory.alphabet_size
+    return grad_q
+
+
+def _approximate_surrogate_grad_chunk(
+    memory: "RouteNgramMemory",
+    q_logits_chunk: torch.Tensor,
+    q_codes_chunk_index: torch.Tensor,
+    order_gradients: Sequence[Tuple[int, torch.Tensor]],
+    route_start: int,
+    accum_dtype: torch.dtype,
+    order_current_memories: Optional[Sequence[Tuple[int, torch.Tensor]]] = None,
+) -> torch.Tensor:
+    if q_codes_chunk_index.dtype not in {torch.int32, torch.int64}:
+        raise TypeError(
+            f"Approximate surrogate indices must be int32 or int64, got {q_codes_chunk_index.dtype}."
+        )
+    _, _, _, bits_per_route = q_logits_chunk.shape
+    temp = float(memory.q_surrogate_temp)
+    scale = float(memory.q_surrogate_scale)
+    logits_acc = q_logits_chunk.to(accum_dtype)
+    p_all = torch.sigmoid(temp * logits_acc)
+    score = torch.zeros_like(p_all, dtype=accum_dtype)
+    contexts = _build_surrogate_contexts(
+        memory=memory,
+        q_codes_chunk_index=q_codes_chunk_index,
+        order_gradients=order_gradients,
+        route_start=route_start,
+        accum_dtype=accum_dtype,
+        order_current_memories=order_current_memories,
+    )
+    if not contexts or temp == 0.0 or scale == 0.0:
+        return score
+    configured_chunk = max(1, int(memory.approx_counterfactual_chunk_size))
+    for context in contexts:
+        current_indices = context.route_offsets + context.address
+        if context.current_memory_valid is None:
+            current_values = F.embedding(current_indices, context.table_weight)
+            if current_values.dtype != accum_dtype:
+                current_values = current_values.to(accum_dtype)
+        else:
+            current_values = context.current_memory_valid
+        current_dot = (current_values * context.grad_valid).sum(dim=-1)
+        flip_masks = memory._approx_flip_masks_for_order(context.ngram_order)
+        if flip_masks.dtype != current_indices.dtype:
+            flip_masks = flip_masks.to(current_indices.dtype)
+        total_counterfactuals = int(context.ngram_order) * bits_per_route
+        chunk_size = min(configured_chunk, total_counterfactuals)
+        for cf_start in range(0, total_counterfactuals, chunk_size):
+            cf_end = min(total_counterfactuals, cf_start + chunk_size)
+            num_counterfactuals = cf_end - cf_start
+            masks = flip_masks[cf_start:cf_end].view(1, 1, 1, num_counterfactuals)
+            expanded_current_indices = current_indices.unsqueeze(-1)
+            flip_indices = torch.bitwise_xor(expanded_current_indices, masks)
+            flip_values = F.embedding(flip_indices, context.table_weight)
+            if flip_values.dtype != accum_dtype:
+                flip_values = flip_values.to(accum_dtype)
+            flip_dot = (flip_values * context.grad_valid.unsqueeze(-2)).sum(dim=-1)
+            bit_is_one = torch.bitwise_and(expanded_current_indices, masks).ne(0)
+            sign = 1.0 - 2.0 * bit_is_one.to(accum_dtype)
+            contribution = (flip_dot - current_dot.unsqueeze(-1)) * sign
+            global_cf = cf_start
+            local_cf = 0
+            while global_cf < cf_end:
+                exp = global_cf // bits_per_route
+                bit_start = global_cf % bits_per_route
+                segment_end = min(cf_end, (exp + 1) * bits_per_route)
+                segment_width = segment_end - global_cf
+                t_lo = exp
+                t_hi = exp + context.valid_length
+                score[:, t_lo:t_hi, :, bit_start : bit_start + segment_width].add_(
+                    contribution[..., local_cf : local_cf + segment_width]
+                )
+                global_cf = segment_end
+                local_cf += segment_width
+    slope = temp * p_all * (1.0 - p_all)
+    return scale * slope * score
+
+
+def _compute_surrogate_grad_chunk(
+    memory: "RouteNgramMemory",
+    q_logits_chunk: torch.Tensor,
+    q_codes_chunk_index: torch.Tensor,
+    order_gradients: Sequence[Tuple[int, torch.Tensor]],
+    route_start: int,
+    accum_dtype: torch.dtype,
+    order_current_memories: Optional[Sequence[Tuple[int, torch.Tensor]]] = None,
+) -> torch.Tensor:
+    if memory.q_surrogate_mode == "exact":
+        return _exact_surrogate_grad_chunk(
+            memory,
+            q_logits_chunk,
+            q_codes_chunk_index,
+            order_gradients,
+            route_start,
+            accum_dtype,
+        )
+    if memory.q_surrogate_mode == "approximate":
+        return _approximate_surrogate_grad_chunk(
+            memory,
+            q_logits_chunk,
+            q_codes_chunk_index,
+            order_gradients,
+            route_start,
+            accum_dtype,
+            order_current_memories=order_current_memories,
+        )
+    raise RuntimeError(f"Unsupported surrogate mode: {memory.q_surrogate_mode!r}.")
+
+
+class LngramQSurrogateFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        flat_memory: torch.Tensor,
+        q_logits: torch.Tensor,
+        q_codes_compact: torch.Tensor,
+        memory_module: "RouteNgramMemory",
+    ):
+        ctx.set_materialize_grads(False)
+        reuse_current = memory_module._can_reuse_approx_forward_memory(flat_memory)
+        ctx.reuse_approx_current_memory = bool(reuse_current)
+        if reuse_current:
+            ctx.save_for_backward(q_logits, q_codes_compact, flat_memory.detach())
+        else:
+            ctx.save_for_backward(q_logits, q_codes_compact)
+        ctx.memory_module = memory_module
+        return flat_memory
+
+    @staticmethod
+    def backward(ctx, grad_flat_memory: Optional[torch.Tensor]):
+        if grad_flat_memory is None:
+            return (None, None, None, None)
+        saved = ctx.saved_tensors
+        q_logits, q_codes_saved = saved[:2]
+        current_flat_memory = saved[2] if ctx.reuse_approx_current_memory else None
+        memory: RouteNgramMemory = ctx.memory_module
+        if not memory.q_surrogate_enable:
+            return (grad_flat_memory, None, None, None)
+        batch, time, channels = q_logits.shape
+        expected_channels = memory.num_routes * memory.bits_per_route
+        if channels != expected_channels:
+            raise ValueError(
+                f"q_logits channels={channels}, expected {expected_channels}."
+            )
+        grad_flat = grad_flat_memory.reshape(
+            batch, time, memory.num_ngram_orders, memory.num_routes, memory.mem_dim
+        )
+        current_memory = (
+            current_flat_memory.reshape(
+                batch, time, memory.num_ngram_orders, memory.num_routes, memory.mem_dim
+            )
+            if current_flat_memory is not None
+            else None
+        )
+        q_logits_btrm = q_logits.reshape(
+            batch, time, memory.num_routes, memory.bits_per_route
+        )
+        index_dtype = memory._surrogate_index_dtype()
+        q_codes_index = q_codes_saved.to(index_dtype)
+        accum_dtype = (
+            torch.float32 if memory.q_surrogate_accum_fp32 else grad_flat_memory.dtype
+        )
+        grad_q = torch.zeros(
+            (batch, time, memory.num_routes, memory.bits_per_route),
+            device=q_logits.device,
+            dtype=accum_dtype,
+        )
+        route_chunk_size = min(
+            max(1, int(memory.q_surrogate_route_chunk_size)), memory.num_routes
+        )
+        for route_start in range(0, memory.num_routes, route_chunk_size):
+            route_end = min(memory.num_routes, route_start + route_chunk_size)
+            order_gradients = [
+                (
+                    int(ngram_order),
+                    grad_flat[:, :, order_index, route_start:route_end, :],
+                )
+                for order_index, ngram_order in enumerate(memory.ngrams)
+            ]
+            order_current_memories = (
+                [
+                    (
+                        int(ngram_order),
+                        current_memory[:, :, order_index, route_start:route_end, :],
+                    )
+                    for order_index, ngram_order in enumerate(memory.ngrams)
+                ]
+                if current_memory is not None
+                else None
+            )
+            grad_q[:, :, route_start:route_end, :] = _compute_surrogate_grad_chunk(
+                memory=memory,
+                q_logits_chunk=q_logits_btrm[:, :, route_start:route_end, :],
+                q_codes_chunk_index=q_codes_index[:, :, route_start:route_end],
+                order_gradients=order_gradients,
+                route_start=route_start,
+                accum_dtype=accum_dtype,
+                order_current_memories=order_current_memories,
+            )
+        return (
+            grad_flat_memory,
+            grad_q.reshape(batch, time, channels).to(q_logits.dtype),
+            None,
+            None,
+        )
+
+
+class LngramQSurrogateChunkFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        memory_chunk: torch.Tensor,
+        q_logits_chunk: torch.Tensor,
+        q_codes_chunk_compact: torch.Tensor,
+        memory_module: "RouteNgramMemory",
+        ngram_order: int,
+        route_offset: int,
+    ):
+        ctx.set_materialize_grads(False)
+        reuse_current = memory_module._can_reuse_approx_forward_memory(memory_chunk)
+        ctx.reuse_approx_current_memory = bool(reuse_current)
+        if reuse_current:
+            ctx.save_for_backward(
+                q_logits_chunk, q_codes_chunk_compact, memory_chunk.detach()
+            )
+        else:
+            ctx.save_for_backward(q_logits_chunk, q_codes_chunk_compact)
+        ctx.memory_module = memory_module
+        ctx.ngram_order = int(ngram_order)
+        ctx.route_offset = int(route_offset)
+        return memory_chunk
+
+    @staticmethod
+    def backward(ctx, grad_memory_chunk: Optional[torch.Tensor]):
+        if grad_memory_chunk is None:
+            return (None, None, None, None, None, None)
+        saved = ctx.saved_tensors
+        q_logits_chunk, q_codes_saved = saved[:2]
+        current_memory_chunk = saved[2] if ctx.reuse_approx_current_memory else None
+        memory: RouteNgramMemory = ctx.memory_module
+        if not memory.q_surrogate_enable:
+            return (grad_memory_chunk, None, None, None, None, None)
+        accum_dtype = (
+            torch.float32 if memory.q_surrogate_accum_fp32 else grad_memory_chunk.dtype
+        )
+        grad_q_chunk = _compute_surrogate_grad_chunk(
+            memory=memory,
+            q_logits_chunk=q_logits_chunk,
+            q_codes_chunk_index=q_codes_saved.to(memory._surrogate_index_dtype()),
+            order_gradients=((ctx.ngram_order, grad_memory_chunk),),
+            route_start=ctx.route_offset,
+            accum_dtype=accum_dtype,
+            order_current_memories=(
+                ((ctx.ngram_order, current_memory_chunk),)
+                if current_memory_chunk is not None
+                else None
+            ),
+        )
+        return (
+            grad_memory_chunk,
+            grad_q_chunk.to(q_logits_chunk.dtype),
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class RouteNgramMemory(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        bits_per_route: int,
+        memory_dim: int,
+        ngrams: Tuple[int, ...],
+        dropout: float,
+        initializer_range: float,
+        table_init_mode: str,
+        table_init_std_scale: float,
+        output_proj_init_std_scale: float,
+        readout_q_proj_init_std_scale: float,
+        readout_kv_proj_init_std_scale: float,
+        readout_num_heads: int,
+        readout_num_kv_heads: int,
+        readout_head_dim: int,
+        readout_attention_dropout: float,
+        readout_proj_bias: bool,
+        readout_use_sdpa: bool,
+        readout_online_accum_fp32: bool,
+        readout_checkpoint_streaming: bool,
+        readout_auto_max_kv_mb: float,
+        rmsnorm_eps: float,
+        conv_kernel_size: int,
+        conv_dilation: Optional[int],
+        conv_bias: bool,
+        conv_zero_init: bool,
+        execution_mode: str,
+        stream_route_chunk_size: int,
+        proj_chunk_size: Optional[int],
+        use_fused_rmsnorm: bool,
+        q_surrogate_enable: bool,
+        q_surrogate_mode: str,
+        q_surrogate_training_only: bool,
+        q_surrogate_temp: float,
+        q_surrogate_scale: float,
+        q_surrogate_route_chunk_size: int,
+        q_surrogate_accum_fp32: bool,
+        exact_code_chunk_size: int,
+        approx_counterfactual_chunk_size: int,
+        approx_reuse_forward_memory: bool,
+        approx_use_int32_indices: bool,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if int(hidden_size) % int(bits_per_route) != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} must be divisible by bits_per_route={bits_per_route}."
+            )
+        if not ngrams or any((int(n) < 1 for n in ngrams)):
+            raise ValueError(f"Invalid ngrams: {ngrams}.")
+        self.hidden_size = int(hidden_size)
+        self.bits_per_route = int(bits_per_route)
+        self.num_routes = self.hidden_size // self.bits_per_route
+        self.alphabet_size = 1 << self.bits_per_route
+        self.mem_dim = int(memory_dim)
+        self.ngrams = tuple(sorted(set((int(n) for n in ngrams))))
+        self.num_ngram_orders = len(self.ngrams)
+        self.route_token_dim = self.num_ngram_orders * self.mem_dim
+        self.readout_num_heads = int(readout_num_heads)
+        self.readout_num_kv_heads = int(readout_num_kv_heads)
+        self.readout_head_dim = int(readout_head_dim)
+        if self.readout_num_heads <= 0:
+            raise ValueError("readout_num_heads must be > 0.")
+        if self.readout_num_kv_heads <= 0:
+            raise ValueError("readout_num_kv_heads must be > 0.")
+        if self.readout_num_heads % self.readout_num_kv_heads != 0:
+            raise ValueError(
+                f"readout_num_heads={self.readout_num_heads} must be divisible by readout_num_kv_heads={self.readout_num_kv_heads}."
+            )
+        if self.readout_head_dim <= 0:
+            raise ValueError("readout_head_dim must be > 0.")
+        if not 0.0 <= float(readout_attention_dropout) < 1.0:
+            raise ValueError("readout_attention_dropout must be in [0, 1).")
+        if float(readout_auto_max_kv_mb) <= 0.0:
+            raise ValueError("readout_auto_max_kv_mb must be > 0.")
+        self.readout_num_key_value_groups = (
+            self.readout_num_heads // self.readout_num_kv_heads
+        )
+        self.readout_inner_dim = self.readout_num_heads * self.readout_head_dim
+        self.readout_kv_inner_dim = self.readout_num_kv_heads * self.readout_head_dim
+        self.readout_softmax_scale = self.readout_head_dim ** (-0.5)
+        self.readout_attention_dropout = float(readout_attention_dropout)
+        self.readout_proj_bias = bool(readout_proj_bias)
+        self.readout_use_sdpa = bool(readout_use_sdpa)
+        self.readout_online_accum_fp32 = bool(readout_online_accum_fp32)
+        self.readout_checkpoint_streaming = bool(readout_checkpoint_streaming)
+        self.readout_auto_max_kv_bytes = int(
+            float(readout_auto_max_kv_mb) * 1024.0 * 1024.0
+        )
+        self._warned_native_gqa_fallback = False
+        self.initializer_range = float(initializer_range)
+        self.table_init_mode = str(table_init_mode).strip().lower()
+        self.table_init_std_scale = float(table_init_std_scale)
+        self.output_proj_init_std_scale = float(output_proj_init_std_scale)
+        self.readout_q_proj_init_std_scale = float(readout_q_proj_init_std_scale)
+        self.readout_kv_proj_init_std_scale = float(readout_kv_proj_init_std_scale)
+        self.q_surrogate_enable = bool(q_surrogate_enable)
+        self.q_surrogate_mode = _canonical_surrogate_mode(q_surrogate_mode)
+        self.q_surrogate_training_only = bool(q_surrogate_training_only)
+        self.q_surrogate_temp = float(q_surrogate_temp)
+        self.q_surrogate_scale = float(q_surrogate_scale)
+        self.q_surrogate_route_chunk_size = int(q_surrogate_route_chunk_size)
+        self.q_surrogate_accum_fp32 = bool(q_surrogate_accum_fp32)
+        self.exact_code_chunk_size = int(exact_code_chunk_size)
+        self.approx_counterfactual_chunk_size = int(approx_counterfactual_chunk_size)
+        self.approx_reuse_forward_memory = bool(approx_reuse_forward_memory)
+        self.approx_use_int32_indices = bool(approx_use_int32_indices)
+        self.execution_mode = _canonical_execution_mode(execution_mode)
+        self.stream_route_chunk_size = int(stream_route_chunk_size)
+        self.proj_chunk_size = None if proj_chunk_size is None else int(proj_chunk_size)
+        self.use_fused_rmsnorm = bool(use_fused_rmsnorm)
+        if self.q_surrogate_route_chunk_size <= 0:
+            raise ValueError("q_surrogate_route_chunk_size must be > 0.")
+        if self.exact_code_chunk_size <= 0:
+            raise ValueError("exact_code_chunk_size must be > 0.")
+        if self.approx_counterfactual_chunk_size <= 0:
+            raise ValueError("approx_counterfactual_chunk_size must be > 0.")
+        if self.stream_route_chunk_size <= 0:
+            raise ValueError("stream_route_chunk_size must be > 0.")
+        if self.proj_chunk_size is not None and self.proj_chunk_size <= 0:
+            raise ValueError("proj_chunk_size must be None or > 0.")
+        bit_positions = torch.arange(
+            self.bits_per_route, device=device, dtype=torch.long
+        )
+        bit_values_long = torch.bitwise_left_shift(
+            torch.ones_like(bit_positions), bit_positions
+        )
+        code_ids = torch.arange(self.alphabet_size, device=device, dtype=torch.long)
+        code_bits_bool = torch.bitwise_and(
+            torch.bitwise_right_shift(
+                code_ids.unsqueeze(-1), bit_positions.unsqueeze(0)
+            ),
+            1,
+        ).bool()
+        route_ids = torch.arange(self.num_routes, device=device, dtype=torch.long)
+        self.register_buffer("_bit_positions", bit_positions, persistent=False)
+        self.register_buffer("_bit_values_long", bit_values_long, persistent=False)
+        self.register_buffer(
+            "_bit_weights_int32", bit_values_long.to(torch.int32), persistent=False
+        )
+        self.register_buffer("_code_ids", code_ids, persistent=False)
+        self.register_buffer("_code_bits_bool", code_bits_bool, persistent=False)
+        self.register_buffer("_route_ids", route_ids, persistent=False)
+        max_table_rows = max(
+            (
+                self.num_routes * self.alphabet_size**ngram_order
+                for ngram_order in self.ngrams
+            )
+        )
+        int32_safe = max_table_rows - 1 <= torch.iinfo(torch.int32).max
+        if self.approx_use_int32_indices and (not int32_safe):
+            warnings.warn(
+                f"Approximate-backward int32 indices were requested, but the largest table has {max_table_rows} rows; falling back to int64."
+            )
+        self._approx_index_dtype = (
+            torch.int32 if self.approx_use_int32_indices and int32_safe else torch.long
+        )
+        self._route_offset_buffer_names: dict[int, str] = {}
+        self._approx_route_offset_buffer_names: dict[int, str] = {}
+        self._approx_flip_mask_buffer_names: dict[int, str] = {}
+        for ngram_order in self.ngrams:
+            long_name = f"_route_offsets_ngram_{ngram_order}"
+            offsets_long = route_ids * self.alphabet_size**ngram_order
+            self.register_buffer(long_name, offsets_long, persistent=False)
+            self._route_offset_buffer_names[ngram_order] = long_name
+            approx_offset_name = f"_approx_route_offsets_ngram_{ngram_order}"
+            self.register_buffer(
+                approx_offset_name,
+                offsets_long.to(self._approx_index_dtype),
+                persistent=False,
+            )
+            self._approx_route_offset_buffer_names[ngram_order] = approx_offset_name
+            flip_mask_name = f"_approx_flip_masks_ngram_{ngram_order}"
+            flip_masks = torch.tensor(
+                [
+                    1 << exp * self.bits_per_route + bit_idx
+                    for exp in range(ngram_order)
+                    for bit_idx in range(self.bits_per_route)
+                ],
+                device=device,
+                dtype=self._approx_index_dtype,
+            )
+            self.register_buffer(flip_mask_name, flip_masks, persistent=False)
+            self._approx_flip_mask_buffer_names[ngram_order] = flip_mask_name
+        table_std = self.initializer_range * self.table_init_std_scale
+        self.tables = nn.ModuleDict()
+        for ngram_order in self.ngrams:
+            vocab_size = self.num_routes * self.alphabet_size**ngram_order
+            table = nn.Embedding(vocab_size, self.mem_dim, device=device, dtype=dtype)
+            init_embedding_weight_(
+                table.weight, mode=self.table_init_mode, std=table_std
+            )
+            self.tables[f"ngram_{ngram_order}"] = table
+        self.lookup_dropout = nn.Dropout(float(dropout))
+        self.suffix_flat_dim = self.num_routes * self.mem_dim
+        self.flat_dim = self.num_ngram_orders * self.suffix_flat_dim
+        self.readout_query_norm = RMSNorm(
+            self.hidden_size,
+            eps=float(rmsnorm_eps),
+            use_fused=self.use_fused_rmsnorm,
+            device=device,
+            dtype=dtype,
+        )
+        self.readout_memory_norm = RMSNorm(
+            self.route_token_dim,
+            eps=float(rmsnorm_eps),
+            use_fused=self.use_fused_rmsnorm,
+            device=device,
+            dtype=dtype,
+        )
+        self.readout_q_proj = nn.Linear(
+            self.hidden_size,
+            self.readout_inner_dim,
+            bias=self.readout_proj_bias,
+            device=device,
+            dtype=dtype,
+        )
+        self.readout_kv_proj = nn.Linear(
+            self.route_token_dim,
+            2 * self.readout_kv_inner_dim,
+            bias=self.readout_proj_bias,
+            device=device,
+            dtype=dtype,
+        )
+        self.readout_o_proj = nn.Linear(
+            self.readout_inner_dim,
+            self.hidden_size,
+            bias=self.readout_proj_bias,
+            device=device,
+            dtype=dtype,
+        )
+        init_linear_weight_(
+            self.readout_q_proj.weight,
+            std=self.initializer_range * self.readout_q_proj_init_std_scale,
+        )
+        init_linear_weight_(
+            self.readout_kv_proj.weight,
+            std=self.initializer_range * self.readout_kv_proj_init_std_scale,
+        )
+        init_linear_weight_(
+            self.readout_o_proj.weight,
+            std=self.initializer_range * self.output_proj_init_std_scale,
+        )
+        for projection in (
+            self.readout_q_proj,
+            self.readout_kv_proj,
+            self.readout_o_proj,
+        ):
+            if projection.bias is not None:
+                nn.init.zeros_(projection.bias)
+        dilation = (
+            int(conv_dilation) if conv_dilation is not None else int(max(self.ngrams))
+        )
+        self.short_conv = DepthwiseCausalConv(
+            hidden_size=self.hidden_size,
+            num_branches=1,
+            kernel_size=int(conv_kernel_size),
+            dilation=dilation,
+            eps=float(rmsnorm_eps),
+            bias=bool(conv_bias),
+            zero_init=bool(conv_zero_init),
+            use_fused_rmsnorm=self.use_fused_rmsnorm,
+            device=device,
+            dtype=dtype,
+        )
+        self.register_load_state_dict_pre_hook(self._migrate_legacy_readout_state_dict)
+
+    def _migrate_legacy_readout_state_dict(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        old_query_norm = prefix + "query_norm.weight"
+        new_query_norm = prefix + "readout_query_norm.weight"
+        if new_query_norm not in state_dict and old_query_norm in state_dict:
+            candidate = state_dict[old_query_norm]
+            if tuple(candidate.shape) == tuple(self.readout_query_norm.weight.shape):
+                state_dict[new_query_norm] = candidate
+        legacy_keys = (
+            prefix + "kv_proj.weight",
+            prefix + "kv_proj.bias",
+            prefix + "value_proj.weight",
+            prefix + "value_proj.bias",
+            prefix + "key_proj.weight",
+            prefix + "key_proj.bias",
+            prefix + "query_norm.weight",
+            prefix + "key_norm.weight",
+        )
+        found_legacy = any((key in state_dict for key in legacy_keys))
+        for key in legacy_keys:
+            state_dict.pop(key, None)
+        if found_legacy:
+            warnings.warn(
+                "Loaded a checkpoint with the old flat Lngram readout. The table, route projection and short convolution can be reused, but the new GQA readout projections are freshly initialized. Optimizer-state resume across this architecture change is not compatible."
+            )
+
+    def _route_offsets_for_order(
+        self, ngram_order: int, dtype: torch.dtype = torch.long
+    ) -> torch.Tensor:
+        order = int(ngram_order)
+        if dtype == torch.int32:
+            name = self._approx_route_offset_buffer_names[order]
+        elif dtype == torch.long:
+            name = self._route_offset_buffer_names[order]
+        else:
+            raise TypeError(f"Unsupported index dtype: {dtype}.")
+        return getattr(self, name)
+
+    def _approx_flip_masks_for_order(self, ngram_order: int) -> torch.Tensor:
+        return getattr(self, self._approx_flip_mask_buffer_names[int(ngram_order)])
+
+    def _surrogate_index_dtype(self) -> torch.dtype:
+        return (
+            self._approx_index_dtype
+            if self.q_surrogate_mode == "approximate"
+            else torch.long
+        )
+
+    def _can_reuse_approx_forward_memory(self, memory_tensor: torch.Tensor) -> bool:
+        if self.q_surrogate_mode != "approximate":
+            return False
+        if not self.approx_reuse_forward_memory:
+            return False
+        if self.training and float(self.lookup_dropout.p) > 0.0:
+            return False
+        return all(
+            (
+                table.weight.dtype == memory_tensor.dtype
+                and table.weight.device == memory_tensor.device
+                for table in self.tables.values()
+            )
+        )
+
+    def quantize_route_logits(self, q_logits: torch.Tensor) -> torch.Tensor:
+        if q_logits.dim() != 3 or q_logits.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"q_logits must be [B, T, {self.hidden_size}], got {tuple(q_logits.shape)}."
+            )
+        batch, time, _ = q_logits.shape
+        bits = (q_logits > 0).reshape(batch, time, self.num_routes, self.bits_per_route)
+        return torch.sum(
+            bits.to(torch.int32) * self._bit_weights_int32.view(1, 1, 1, -1),
+            dim=-1,
+            dtype=torch.int32,
+        )
+
+    def _compact_codes(self, route_codes_btr: torch.Tensor) -> torch.Tensor:
+        if self.bits_per_route <= 8:
+            target_dtype = torch.uint8
+        elif self.bits_per_route <= 15:
+            target_dtype = torch.int16
+        else:
+            target_dtype = torch.int32
+        if route_codes_btr.dtype == target_dtype:
+            return route_codes_btr
+        return route_codes_btr.to(target_dtype)
+
+    def _should_use_surrogate(self, q_logits: Optional[torch.Tensor]) -> bool:
+        if not self.q_surrogate_enable or q_logits is None:
+            return False
+        if self.q_surrogate_training_only and (not self.training):
+            return False
+        if not torch.is_grad_enabled() or not q_logits.requires_grad:
+            return False
+        if self.q_surrogate_scale == 0.0 or self.q_surrogate_temp == 0.0:
+            return False
+        return True
+
+    def _build_valid_global_indices_from_chunk(
+        self, route_codes_chunk_long: torch.Tensor, ngram_order: int, route_start: int
+    ) -> torch.Tensor:
+        if route_codes_chunk_long.dtype != torch.long:
+            raise TypeError("route_codes_chunk_long must already be torch.long.")
+        if route_codes_chunk_long.dim() != 3:
+            raise ValueError(
+                f"route_codes_chunk_long must be [B, T, Rc], got {tuple(route_codes_chunk_long.shape)}."
+            )
+        route_count = route_codes_chunk_long.shape[-1]
+        route_end = int(route_start) + route_count
+        if not 0 <= int(route_start) < route_end <= self.num_routes:
+            raise ValueError(
+                f"Invalid route range [{route_start}, {route_end}) for num_routes={self.num_routes}."
+            )
+        address = _build_ngram_address(
+            route_codes_chunk_long,
+            ngram_order=int(ngram_order),
+            alphabet_size=self.alphabet_size,
+        )
+        route_offsets = self._route_offsets_for_order(int(ngram_order))[
+            int(route_start) : route_end
+        ].view(1, 1, route_count)
+        return route_offsets + address
+
+    def _build_valid_global_indices(
+        self,
+        route_codes_long: torch.Tensor,
+        ngram_order: int,
+        route_start: int = 0,
+        route_end: Optional[int] = None,
+    ) -> torch.Tensor:
+        if route_codes_long.dtype != torch.long:
+            raise TypeError("route_codes_long must already be torch.long.")
+        route_end = self.num_routes if route_end is None else int(route_end)
+        route_start = int(route_start)
+        if not 0 <= route_start < route_end <= self.num_routes:
+            raise ValueError(
+                f"Invalid route range [{route_start}, {route_end}) for num_routes={self.num_routes}."
+            )
+        return self._build_valid_global_indices_from_chunk(
+            route_codes_long[:, :, route_start:route_end],
+            ngram_order=int(ngram_order),
+            route_start=route_start,
+        )
+
+    def _lookup_single_ngram_from_chunk(
+        self, route_codes_chunk_long: torch.Tensor, ngram_order: int, route_start: int
+    ) -> torch.Tensor:
+        batch, time, route_count = route_codes_chunk_long.shape
+        output_dtype = self.readout_kv_proj.weight.dtype
+        valid_length = time - int(ngram_order) + 1
+        if valid_length <= 0:
+            return torch.zeros(
+                (batch, time, route_count, self.mem_dim),
+                device=route_codes_chunk_long.device,
+                dtype=output_dtype,
+            )
+        indices = self._build_valid_global_indices_from_chunk(
+            route_codes_chunk_long,
+            ngram_order=int(ngram_order),
+            route_start=int(route_start),
+        )
+        valid_memory = self.tables[f"ngram_{ngram_order}"](indices)
+        if valid_memory.dtype != output_dtype:
+            valid_memory = valid_memory.to(output_dtype)
+        prefix = int(ngram_order) - 1
+        return (
+            F.pad(valid_memory, (0, 0, 0, 0, prefix, 0)) if prefix > 0 else valid_memory
+        )
+
+    def _lookup_single_ngram_route_chunk(
+        self,
+        route_codes_long: torch.Tensor,
+        ngram_order: int,
+        route_start: int,
+        route_end: int,
+    ) -> torch.Tensor:
+        if route_codes_long.dtype != torch.long:
+            raise TypeError("route_codes_long must already be torch.long.")
+        if not 0 <= route_start < route_end <= self.num_routes:
+            raise ValueError(f"Invalid route chunk [{route_start}, {route_end}).")
+        return self._lookup_single_ngram_from_chunk(
+            route_codes_long[:, :, route_start:route_end],
+            ngram_order=int(ngram_order),
+            route_start=int(route_start),
+        )
+
+    def lookup(self, route_codes_btr: torch.Tensor) -> torch.Tensor:
+        route_codes_long = (
+            route_codes_btr
+            if route_codes_btr.dtype == torch.long
+            else route_codes_btr.to(torch.long)
+        )
+        batch, time, num_routes = route_codes_long.shape
+        if num_routes != self.num_routes:
+            raise ValueError(f"num_routes={num_routes}, expected {self.num_routes}.")
+        memories = [
+            self._lookup_single_ngram_from_chunk(
+                route_codes_long, ngram_order=ngram_order, route_start=0
+            )
+            for ngram_order in self.ngrams
+        ]
+        memory_order_major = torch.stack(memories, dim=2)
+        memory_order_major = self.lookup_dropout(memory_order_major)
+        flat = memory_order_major.reshape(batch, time, self.flat_dim)
+        output_dtype = self.readout_kv_proj.weight.dtype
+        return flat if flat.dtype == output_dtype else flat.to(output_dtype)
+
+    def _reshape_flat_to_route_tokens(self, flat_memory: torch.Tensor) -> torch.Tensor:
+        if flat_memory.dim() != 3:
+            raise ValueError(
+                f"flat_memory must be [B, T, F], got {tuple(flat_memory.shape)}."
+            )
+        if flat_memory.shape[-1] != self.flat_dim:
+            raise ValueError(
+                f"flat_memory dim={flat_memory.shape[-1]}, expected {self.flat_dim}."
+            )
+        batch, time, _ = flat_memory.shape
+        order_major = flat_memory.view(
+            batch, time, self.num_ngram_orders, self.num_routes, self.mem_dim
+        )
+        return (
+            order_major.permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .view(batch, time, self.num_routes, self.route_token_dim)
+        )
+
+    def _lookup_route_token_chunk(
+        self,
+        route_codes_chunk_long: torch.Tensor,
+        route_start: int,
+        q_logits_chunk: Optional[torch.Tensor],
+        compact_codes_chunk: Optional[torch.Tensor],
+        use_surrogate: bool,
+    ) -> torch.Tensor:
+        memories = []
+        for ngram_order in self.ngrams:
+            memory = self._lookup_single_ngram_from_chunk(
+                route_codes_chunk_long,
+                ngram_order=int(ngram_order),
+                route_start=int(route_start),
+            )
+            if use_surrogate:
+                if q_logits_chunk is None or compact_codes_chunk is None:
+                    raise RuntimeError(
+                        "Surrogate readout requires q_logits_chunk and compact codes."
+                    )
+                memory = LngramQSurrogateChunkFunction.apply(
+                    memory,
+                    q_logits_chunk,
+                    compact_codes_chunk,
+                    self,
+                    int(ngram_order),
+                    int(route_start),
+                )
+            memories.append(memory)
+        route_tokens = torch.cat(memories, dim=-1)
+        return self.lookup_dropout(route_tokens)
+
+    def _project_route_token_chunk(
+        self,
+        route_codes_chunk_long: torch.Tensor,
+        route_start: int,
+        q_logits_chunk: Optional[torch.Tensor],
+        compact_codes_chunk: Optional[torch.Tensor],
+        use_surrogate: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        route_tokens = self._lookup_route_token_chunk(
+            route_codes_chunk_long=route_codes_chunk_long,
+            route_start=int(route_start),
+            q_logits_chunk=q_logits_chunk,
+            compact_codes_chunk=compact_codes_chunk,
+            use_surrogate=bool(use_surrogate),
+        )
+        route_tokens = self.readout_memory_norm(route_tokens)
+        kv = chunked_linear_lastdim(
+            route_tokens, self.readout_kv_proj, self.proj_chunk_size
+        )
+        key_flat, value_flat = kv.split(self.readout_kv_inner_dim, dim=-1)
+        batch, time, route_count, _ = key_flat.shape
+        key = key_flat.view(
+            batch, time, route_count, self.readout_num_kv_heads, self.readout_head_dim
+        ).permute(0, 1, 3, 2, 4)
+        value = value_flat.view(
+            batch, time, route_count, self.readout_num_kv_heads, self.readout_head_dim
+        ).permute(0, 1, 3, 2, 4)
+        return (key, value)
+
+    def _project_query(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch, time, _ = hidden_states.shape
+        query = self.readout_q_proj(self.readout_query_norm(hidden_states))
+        return query.view(batch, time, self.readout_num_heads, self.readout_head_dim)
+
+    def _manual_grouped_attention(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        batch, time, _, _ = query.shape
+        query_grouped = query.view(
+            batch,
+            time,
+            self.readout_num_kv_heads,
+            self.readout_num_key_value_groups,
+            self.readout_head_dim,
+        )
+        scores = torch.matmul(query_grouped, key.transpose(-1, -2))
+        scores = scores.to(torch.float32) * self.readout_softmax_scale
+        probabilities = torch.softmax(scores, dim=-1)
+        dropout_p = self.readout_attention_dropout if self.training else 0.0
+        if dropout_p > 0.0:
+            probabilities = F.dropout(probabilities, p=dropout_p, training=True)
+        output = torch.matmul(probabilities.to(value.dtype), value)
+        return output.reshape(
+            batch, time, self.readout_num_heads, self.readout_head_dim
+        )
+
+    def _full_gqa_attention(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.readout_use_sdpa:
+            return self._manual_grouped_attention(query, key, value)
+        batch, time, _, _ = query.shape
+        route_count = key.shape[-2]
+        query_sdpa = query.reshape(
+            batch * time, self.readout_num_heads, 1, self.readout_head_dim
+        )
+        key_sdpa = key.reshape(
+            batch * time, self.readout_num_kv_heads, route_count, self.readout_head_dim
+        )
+        value_sdpa = value.reshape(
+            batch * time, self.readout_num_kv_heads, route_count, self.readout_head_dim
+        )
+        dropout_p = self.readout_attention_dropout if self.training else 0.0
+        try:
+            if self.readout_num_heads == self.readout_num_kv_heads:
+                output = F.scaled_dot_product_attention(
+                    query_sdpa,
+                    key_sdpa,
+                    value_sdpa,
+                    dropout_p=dropout_p,
+                    is_causal=False,
+                    scale=self.readout_softmax_scale,
+                )
+            else:
+                output = F.scaled_dot_product_attention(
+                    query_sdpa,
+                    key_sdpa,
+                    value_sdpa,
+                    dropout_p=dropout_p,
+                    is_causal=False,
+                    scale=self.readout_softmax_scale,
+                    enable_gqa=True,
+                )
+        except (TypeError, RuntimeError) as exc:
+            message = str(exc).lower()
+            known_gqa_failure = (
+                isinstance(exc, TypeError)
+                or "gqa" in message
+                or "head" in message
+                or ("scaled_dot_product" in message)
+                or ("kernel" in message)
+            )
+            if not known_gqa_failure:
+                raise
+            if not self._warned_native_gqa_fallback:
+                warnings.warn(
+                    f"Native SDPA GQA is unavailable for this PyTorch/backend; falling back to grouped matmul without repeating K/V heads. Original error: {exc}"
+                )
+                self._warned_native_gqa_fallback = True
+            return self._manual_grouped_attention(query, key, value)
+        return output.reshape(
+            batch, time, self.readout_num_heads, self.readout_head_dim
+        )
+
+    def _online_attention_update(
+        self,
+        running_max: torch.Tensor,
+        running_sum: torch.Tensor,
+        running_value: torch.Tensor,
+        query_grouped: torch.Tensor,
+        key_chunk: torch.Tensor,
+        value_chunk: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        accum_dtype = running_sum.dtype
+        scores = torch.matmul(query_grouped, key_chunk.transpose(-1, -2))
+        scores = scores.to(accum_dtype) * self.readout_softmax_scale
+        chunk_max = scores.max(dim=-1).values
+        new_max = torch.maximum(running_max, chunk_max).detach()
+        old_scale = torch.exp(running_max - new_max)
+        exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+        new_sum = running_sum * old_scale + exp_scores.sum(dim=-1)
+        numerator_weights = exp_scores
+        dropout_p = self.readout_attention_dropout if self.training else 0.0
+        if dropout_p > 0.0:
+            numerator_weights = F.dropout(numerator_weights, p=dropout_p, training=True)
+        chunk_value = torch.matmul(numerator_weights, value_chunk.to(accum_dtype))
+        new_value = running_value * old_scale.unsqueeze(-1) + chunk_value
+        return (new_max, new_sum, new_value)
+
+    def _streaming_gqa_attention(
+        self,
+        query: torch.Tensor,
+        route_codes_long: torch.Tensor,
+        q_logits_btrm: Optional[torch.Tensor],
+        compact_codes: Optional[torch.Tensor],
+        use_surrogate: bool,
+    ) -> torch.Tensor:
+        batch, time, _, _ = query.shape
+        query_grouped = query.view(
+            batch,
+            time,
+            self.readout_num_kv_heads,
+            self.readout_num_key_value_groups,
+            self.readout_head_dim,
+        )
+        accum_dtype = torch.float32 if self.readout_online_accum_fp32 else query.dtype
+        state_shape = (
+            batch,
+            time,
+            self.readout_num_kv_heads,
+            self.readout_num_key_value_groups,
+        )
+        running_max = torch.full(
+            state_shape, -torch.inf, device=query.device, dtype=accum_dtype
+        )
+        running_sum = torch.zeros(state_shape, device=query.device, dtype=accum_dtype)
+        running_value = torch.zeros(
+            (*state_shape, self.readout_head_dim),
+            device=query.device,
+            dtype=accum_dtype,
+        )
+        route_chunk_size = min(max(1, self.stream_route_chunk_size), self.num_routes)
+        empty_logits = query.new_empty((0,))
+        empty_codes = route_codes_long.new_empty((0,), dtype=torch.uint8)
+        checkpoint_chunks = (
+            self.readout_checkpoint_streaming
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        for route_start in range(0, self.num_routes, route_chunk_size):
+            route_end = min(self.num_routes, route_start + route_chunk_size)
+            route_codes_chunk = route_codes_long[:, :, route_start:route_end]
+            q_logits_chunk = (
+                q_logits_btrm[:, :, route_start:route_end, :]
+                if use_surrogate and q_logits_btrm is not None
+                else empty_logits
+            )
+            compact_codes_chunk = (
+                compact_codes[:, :, route_start:route_end]
+                if use_surrogate and compact_codes is not None
+                else empty_codes
+            )
+
+            def chunk_step(
+                running_max_arg: torch.Tensor,
+                running_sum_arg: torch.Tensor,
+                running_value_arg: torch.Tensor,
+                query_grouped_arg: torch.Tensor,
+                route_codes_arg: torch.Tensor,
+                q_logits_arg: torch.Tensor,
+                compact_codes_arg: torch.Tensor,
+                _route_start: int = route_start,
+                _use_surrogate: bool = use_surrogate,
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                key_chunk, value_chunk = self._project_route_token_chunk(
+                    route_codes_chunk_long=route_codes_arg,
+                    route_start=_route_start,
+                    q_logits_chunk=q_logits_arg if _use_surrogate else None,
+                    compact_codes_chunk=compact_codes_arg if _use_surrogate else None,
+                    use_surrogate=_use_surrogate,
+                )
+                return self._online_attention_update(
+                    running_max=running_max_arg,
+                    running_sum=running_sum_arg,
+                    running_value=running_value_arg,
+                    query_grouped=query_grouped_arg,
+                    key_chunk=key_chunk,
+                    value_chunk=value_chunk,
+                )
+
+            if checkpoint_chunks:
+                running_max, running_sum, running_value = (
+                    torch.utils.checkpoint.checkpoint(
+                        chunk_step,
+                        running_max,
+                        running_sum,
+                        running_value,
+                        query_grouped,
+                        route_codes_chunk,
+                        q_logits_chunk,
+                        compact_codes_chunk,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                )
+            else:
+                running_max, running_sum, running_value = chunk_step(
+                    running_max,
+                    running_sum,
+                    running_value,
+                    query_grouped,
+                    route_codes_chunk,
+                    q_logits_chunk,
+                    compact_codes_chunk,
+                )
+        tiny = torch.finfo(running_sum.dtype).tiny
+        output = running_value / running_sum.clamp_min(tiny).unsqueeze(-1)
+        return output.to(query.dtype).reshape(
+            batch, time, self.readout_num_heads, self.readout_head_dim
+        )
+
+    def _collect_full_kv(
+        self,
+        route_codes_long: torch.Tensor,
+        q_logits_btrm: Optional[torch.Tensor],
+        compact_codes: Optional[torch.Tensor],
+        use_surrogate: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        route_chunk_size = min(max(1, self.stream_route_chunk_size), self.num_routes)
+        key_chunks = []
+        value_chunks = []
+        for route_start in range(0, self.num_routes, route_chunk_size):
+            route_end = min(self.num_routes, route_start + route_chunk_size)
+            key_chunk, value_chunk = self._project_route_token_chunk(
+                route_codes_chunk_long=route_codes_long[:, :, route_start:route_end],
+                route_start=route_start,
+                q_logits_chunk=(
+                    q_logits_btrm[:, :, route_start:route_end, :]
+                    if use_surrogate and q_logits_btrm is not None
+                    else None
+                ),
+                compact_codes_chunk=(
+                    compact_codes[:, :, route_start:route_end]
+                    if use_surrogate and compact_codes is not None
+                    else None
+                ),
+                use_surrogate=use_surrogate,
+            )
+            key_chunks.append(key_chunk)
+            value_chunks.append(value_chunk)
+        if not key_chunks:
+            raise RuntimeError("No route chunk was produced.")
+        return (torch.cat(key_chunks, dim=3), torch.cat(value_chunks, dim=3))
+
+    def _resolve_execution_mode(self, hidden_states: torch.Tensor) -> str:
+        if self.execution_mode != "auto":
+            return self.execution_mode
+        batch, time, _ = hidden_states.shape
+        estimated_full_kv_bytes = (
+            batch
+            * time
+            * self.num_routes
+            * 2
+            * self.readout_num_kv_heads
+            * self.readout_head_dim
+            * hidden_states.element_size()
+        )
+        return (
+            "full"
+            if estimated_full_kv_bytes <= self.readout_auto_max_kv_bytes
+            else "streaming"
+        )
+
+    def _finish_readout(self, head_output: torch.Tensor) -> torch.Tensor:
+        batch, time, _, _ = head_output.shape
+        mixed = self.readout_o_proj(
+            head_output.reshape(batch, time, self.readout_inner_dim)
+        )
+        conv_out = self.short_conv(mixed.unsqueeze(2)).squeeze(2)
+        return mixed + conv_out
+
+    def inject(
+        self, hidden_states: torch.Tensor, flat_memory: torch.Tensor
+    ) -> torch.Tensor:
+        route_tokens = self._reshape_flat_to_route_tokens(flat_memory)
+        route_tokens = self.readout_memory_norm(route_tokens)
+        kv = chunked_linear_lastdim(
+            route_tokens, self.readout_kv_proj, self.proj_chunk_size
+        )
+        key_flat, value_flat = kv.split(self.readout_kv_inner_dim, dim=-1)
+        batch, time, route_count, _ = key_flat.shape
+        key = key_flat.view(
+            batch, time, route_count, self.readout_num_kv_heads, self.readout_head_dim
+        ).permute(0, 1, 3, 2, 4)
+        value = value_flat.view(
+            batch, time, route_count, self.readout_num_kv_heads, self.readout_head_dim
+        ).permute(0, 1, 3, 2, 4)
+        query = self._project_query(hidden_states)
+        return self._finish_readout(self._full_gqa_attention(query, key, value))
+
+    def inject_from_route_codes(
+        self,
+        hidden_states: torch.Tensor,
+        route_codes_btr: torch.Tensor,
+        q_logits: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if hidden_states.dim() != 3:
+            raise ValueError(
+                f"hidden_states must be [B, T, C], got {tuple(hidden_states.shape)}."
+            )
+        if route_codes_btr.dim() != 3:
+            raise ValueError(
+                f"route_codes_btr must be [B, T, R], got {tuple(route_codes_btr.shape)}."
+            )
+        batch, time, channels = hidden_states.shape
+        if channels != self.hidden_size:
+            raise ValueError(f"hidden size={channels}, expected {self.hidden_size}.")
+        if route_codes_btr.shape != (batch, time, self.num_routes):
+            raise ValueError(
+                f"route_codes shape={tuple(route_codes_btr.shape)}, expected {(batch, time, self.num_routes)}."
+            )
+        if q_logits is not None and q_logits.shape != (batch, time, self.hidden_size):
+            raise ValueError(
+                f"q_logits shape={tuple(q_logits.shape)}, expected {(batch, time, self.hidden_size)}."
+            )
+        route_codes_long = (
+            route_codes_btr
+            if route_codes_btr.dtype == torch.long
+            else route_codes_btr.to(torch.long)
+        )
+        use_surrogate = self._should_use_surrogate(q_logits)
+        compact_codes = self._compact_codes(route_codes_btr) if use_surrogate else None
+        q_logits_btrm = (
+            q_logits.reshape(batch, time, self.num_routes, self.bits_per_route)
+            if use_surrogate and q_logits is not None
+            else None
+        )
+        query = self._project_query(hidden_states)
+        execution_mode = self._resolve_execution_mode(hidden_states)
+        if execution_mode == "full":
+            key, value = self._collect_full_kv(
+                route_codes_long=route_codes_long,
+                q_logits_btrm=q_logits_btrm,
+                compact_codes=compact_codes,
+                use_surrogate=use_surrogate,
+            )
+            head_output = self._full_gqa_attention(query, key, value)
+        else:
+            head_output = self._streaming_gqa_attention(
+                query=query,
+                route_codes_long=route_codes_long,
+                q_logits_btrm=q_logits_btrm,
+                compact_codes=compact_codes,
+                use_surrogate=use_surrogate,
+            )
+        return self._finish_readout(head_output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        route_codes_btr: torch.Tensor,
+        q_logits: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.inject_from_route_codes(
+            hidden_states=hidden_states,
+            route_codes_btr=route_codes_btr,
+            q_logits=q_logits,
+        )
+
+
+def estimate_lngram_parameters_per_layer(
+    hidden_size: int,
+    bits_per_route: int,
+    memory_dim: int,
+    ngrams: Tuple[int, ...],
+    readout_num_heads: int,
+    readout_num_kv_heads: int,
+    readout_head_dim: int,
+    readout_proj_bias: bool,
+    conv_kernel_size: int,
+    conv_bias: bool,
+) -> int:
+    if hidden_size % bits_per_route != 0:
+        raise ValueError(
+            f"hidden_size={hidden_size} must be divisible by bits_per_route={bits_per_route}."
+        )
+    if readout_num_heads % readout_num_kv_heads != 0:
+        raise ValueError("readout_num_heads must be divisible by readout_num_kv_heads.")
+    num_routes = hidden_size // bits_per_route
+    alphabet_size = 1 << bits_per_route
+    num_orders = len(tuple(ngrams))
+    route_token_dim = num_orders * memory_dim
+    readout_inner_dim = readout_num_heads * readout_head_dim
+    readout_kv_inner_dim = readout_num_kv_heads * readout_head_dim
+    route_q_proj_params = hidden_size * hidden_size
+    table_params = (
+        num_routes * memory_dim * sum((alphabet_size ** int(n) for n in ngrams))
+    )
+    readout_params = (
+        hidden_size * readout_inner_dim
+        + route_token_dim * (2 * readout_kv_inner_dim)
+        + readout_inner_dim * hidden_size
+    )
+    if readout_proj_bias:
+        readout_params += readout_inner_dim + 2 * readout_kv_inner_dim + hidden_size
+    norm_params = hidden_size + route_token_dim + hidden_size
+    conv_params = hidden_size * int(conv_kernel_size)
+    if conv_bias:
+        conv_params += hidden_size
+    return (
+        route_q_proj_params + table_params + readout_params + norm_params + conv_params
+    )
+
+
+def collect_lngram_table_parameter_names(model: nn.Module) -> set[str]:
+    return {
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and "lngram_memory.tables." in name
+    }
+
+
+def build_lngram_optimizer_param_groups(
+    model: nn.Module,
+    learning_rate: float,
+    weight_decay: float,
+    decay_parameter_names: Iterable[str],
+    lngram_config: LngramConfig,
+) -> list[dict]:
+    decay_parameter_names = set(decay_parameter_names)
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    table_names = collect_lngram_table_parameter_names(model)
+    table_params = [
+        parameter for name, parameter in named_parameters if name in table_names
+    ]
+    decay_params = [
+        parameter
+        for name, parameter in named_parameters
+        if name not in table_names and name in decay_parameter_names
+    ]
+    no_decay_params = [
+        parameter
+        for name, parameter in named_parameters
+        if name not in table_names and name not in decay_parameter_names
+    ]
+    groups: list[dict] = []
+    if table_params:
+        groups.append(
+            {
+                "params": table_params,
+                "lr": float(learning_rate) * float(lngram_config.table_lr_multiplier),
+                "weight_decay": float(lngram_config.table_weight_decay),
+            }
+        )
+    if decay_params:
+        groups.append(
+            {
+                "params": decay_params,
+                "lr": float(learning_rate),
+                "weight_decay": float(weight_decay),
+            }
+        )
+    if no_decay_params:
+        groups.append(
+            {"params": no_decay_params, "lr": float(learning_rate), "weight_decay": 0.0}
+        )
+    return groups
