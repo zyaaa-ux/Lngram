@@ -10,7 +10,7 @@ It is recommended to start the reproduction with a single-table lngram combined 
 ![Lngram Overview](lngram.png)
 
 
-## 2026-7-18
+## 2026-7-18: Greate Lngram_v2
 
 1. Fixed a major flaw in the readout module of v1. The new version adopts a GQA-like readout mechanism, with virtually zero active parameters while delivering significantly improved performance.
 2. Unified the single-table and multi-table configurations into a single design. Lngram capacity can now be flexibly controlled by adjusting mem_dim and kvhead.
