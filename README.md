@@ -7,7 +7,7 @@ The paper is available at https://arxiv.org/abs/2605.24869.
 
 It is recommended to start the reproduction with a single-table lngram combined with approximate gradient backpropagation, which can already achieve performance superior to the baseline model. Training the multi-table version is more complex and prone to convergence issues; moreover, exact gradient computation is relatively slow.
 
-![Lngram Overview](lngram.png)
+![Lngram Overview](lngram_v2.png)
 
 
 ## 2026-7-18: Greate Lngram_v2
