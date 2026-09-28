@@ -3,19 +3,12 @@
 Lngram upgrades Engram from modeling on **tokenizer IDs** to modeling on **hidden-state IDs**.  
 With this design, Lngram achieves stronger performance while naturally supporting deployment on models beyond the language domain, including models in other modalities.
 
-The paper is available at https://arxiv.org/abs/2605.24869 (v1).
+The paper is available at https://arxiv.org/abs/2605.24869.
 
 It is recommended to start the reproduction with a single-table lngram combined with approximate gradient backpropagation, which can already achieve performance superior to the baseline model. Training the multi-table version is more complex and prone to convergence issues; moreover, exact gradient computation is relatively slow.
 
-![Lngram Overview](lngram_v2.png)
+![Lngram Overview](lngram.png)
 
-
-## 2026-7-18: Lngram_v2
-
-1. Fixed a major flaw in the readout module of v1. The new version adopts a GQA-like readout mechanism, with virtually zero active parameters while delivering significantly improved performance.
-2. Unified the single-table and multi-table configurations into a single design. Lngram capacity can now be flexibly controlled by adjusting mem_dim and kvhead.
-3. **Most importantly, Lngram suggests a relatively stable mapping between hidden semantics and Lngram IDs.** We validate this property and construct a semantic–ID dictionary for a 2B model, providing a new perspective on model interpretability.
-4. You can first learn more about Lngram v2 through 【】. We will continue to expand and improve this work, particularly with deeper analyses of its interpretability and broader practical applications. We expect many more meaningful and exciting developments as the research progresses.
 
 
 ## Introduction
