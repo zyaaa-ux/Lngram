@@ -9,6 +9,8 @@ It is recommended to start the reproduction with a single-table lngram combined 
 
 ![Lngram Overview](lngram_v2.png)
 
+The ICLR template was used solely for formatting purposes and does not imply that the work has been submitted to ICLR.
+
 
 
 ## Introduction
