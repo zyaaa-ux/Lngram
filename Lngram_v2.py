@@ -1167,29 +1167,12 @@ class _RouteNgramMemoryBase(nn.Module):
             else None
         )
 
-        self.readout_num_heads = int(readout_num_heads)
-        self.readout_num_kv_heads = int(readout_num_kv_heads)
-        self.readout_head_dim = int(readout_head_dim)
-        if (
-            self.readout_num_heads <= 0
-            or self.readout_num_kv_heads <= 0
-            or self.readout_head_dim <= 0
-        ):
-            raise ValueError("readout head counts and head dimension must be positive")
-        if self.readout_num_heads % self.readout_num_kv_heads:
-            raise ValueError("readout_num_heads must be divisible by readout_num_kv_heads")
-        if self.readout_num_heads * self.readout_head_dim != self.hidden_size:
-            raise ValueError(
-                "LNGram GQA must preserve the full query width: "
-                "readout_num_heads * readout_head_dim must equal hidden_size; "
-                f"got {self.readout_num_heads} * {self.readout_head_dim} != "
-                f"{self.hidden_size}"
-            )
-        self.readout_groups = self.readout_num_heads // self.readout_num_kv_heads
-        self.readout_inner_dim = self.readout_num_heads * self.readout_head_dim
-        self.readout_kv_inner_dim = self.readout_num_kv_heads * self.readout_head_dim
-        self.softmax_scale = self.readout_head_dim ** -0.5
-        self.readout_attention_dropout = float(readout_attention_dropout)
+        self._initialize_readout_layout(
+            readout_num_heads=readout_num_heads,
+            readout_num_kv_heads=readout_num_kv_heads,
+            readout_head_dim=readout_head_dim,
+            readout_attention_dropout=readout_attention_dropout,
+        )
         self.execution_mode = str(execution_mode).lower()
         if self.execution_mode not in {"full", "streaming", "auto"}:
             raise ValueError("execution_mode must be full, streaming, or auto")
@@ -1220,14 +1203,82 @@ class _RouteNgramMemoryBase(nn.Module):
             self.tables[f"ngram_{order}"] = table
         self.lookup_dropout = nn.Dropout(float(dropout))
 
+        self._initialize_readout_modules(
+            normalization=normalization,
+            rmsnorm_eps=rmsnorm_eps,
+            initializer_range=initializer_range,
+            output_proj_init_std_scale=output_proj_init_std_scale,
+            readout_q_proj_init_std_scale=readout_q_proj_init_std_scale,
+            readout_kv_proj_init_std_scale=readout_kv_proj_init_std_scale,
+            device=device,
+            dtype=dtype,
+        )
+        self.short_conv = DepthwiseCausalConv(
+            hidden_size,
+            kernel_size=conv_kernel_size,
+            dilation=max(self.ngrams) if conv_dilation is None else int(conv_dilation),
+            eps=rmsnorm_eps,
+            normalization=normalization,
+            bias=conv_bias,
+            zero_init=conv_zero_init,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _initialize_readout_layout(
+        self,
+        *,
+        readout_num_heads: int,
+        readout_num_kv_heads: int,
+        readout_head_dim: int,
+        readout_attention_dropout: float,
+    ) -> None:
+        """Initialize GQA metadata; alternative readouts may override this hook."""
+        self.readout_num_heads = int(readout_num_heads)
+        self.readout_num_kv_heads = int(readout_num_kv_heads)
+        self.readout_head_dim = int(readout_head_dim)
+        if (
+            self.readout_num_heads <= 0
+            or self.readout_num_kv_heads <= 0
+            or self.readout_head_dim <= 0
+        ):
+            raise ValueError("readout head counts and head dimension must be positive")
+        if self.readout_num_heads % self.readout_num_kv_heads:
+            raise ValueError("readout_num_heads must be divisible by readout_num_kv_heads")
+        if self.readout_num_heads * self.readout_head_dim != self.hidden_size:
+            raise ValueError(
+                "LNGram GQA must preserve the full query width: "
+                "readout_num_heads * readout_head_dim must equal hidden_size; "
+                f"got {self.readout_num_heads} * {self.readout_head_dim} != "
+                f"{self.hidden_size}"
+            )
+        self.readout_groups = self.readout_num_heads // self.readout_num_kv_heads
+        self.readout_inner_dim = self.readout_num_heads * self.readout_head_dim
+        self.readout_kv_inner_dim = self.readout_num_kv_heads * self.readout_head_dim
+        self.softmax_scale = self.readout_head_dim ** -0.5
+        self.readout_attention_dropout = float(readout_attention_dropout)
+
+    def _initialize_readout_modules(
+        self,
+        *,
+        normalization: str,
+        rmsnorm_eps: float,
+        initializer_range: float,
+        output_proj_init_std_scale: float,
+        readout_q_proj_init_std_scale: float,
+        readout_kv_proj_init_std_scale: float,
+        device,
+        dtype,
+    ) -> None:
+        """Initialize standard GQA readout projections and normalizations."""
         self.readout_query_norm = build_lngram_norm(
-            normalization, hidden_size, rmsnorm_eps, device=device, dtype=dtype
+            normalization, self.hidden_size, rmsnorm_eps, device=device, dtype=dtype
         )
         self.readout_memory_norm = build_lngram_norm(
             normalization, self.route_token_dim, rmsnorm_eps, device=device, dtype=dtype
         )
         self.readout_q_proj = nn.Linear(
-            hidden_size, self.readout_inner_dim, bias=False, device=device, dtype=dtype
+            self.hidden_size, self.readout_inner_dim, bias=False, device=device, dtype=dtype
         )
         self.readout_kv_proj = nn.Linear(
             self.route_token_dim,
@@ -1237,7 +1288,7 @@ class _RouteNgramMemoryBase(nn.Module):
             dtype=dtype,
         )
         self.readout_o_proj = nn.Linear(
-            self.readout_inner_dim, hidden_size, bias=False, device=device, dtype=dtype
+            self.readout_inner_dim, self.hidden_size, bias=False, device=device, dtype=dtype
         )
         _normal_init(
             self.readout_q_proj.weight,
@@ -1250,17 +1301,6 @@ class _RouteNgramMemoryBase(nn.Module):
         _normal_init(
             self.readout_o_proj.weight,
             initializer_range * output_proj_init_std_scale,
-        )
-        self.short_conv = DepthwiseCausalConv(
-            hidden_size,
-            kernel_size=conv_kernel_size,
-            dilation=max(self.ngrams) if conv_dilation is None else int(conv_dilation),
-            eps=rmsnorm_eps,
-            normalization=normalization,
-            bias=conv_bias,
-            zero_init=conv_zero_init,
-            device=device,
-            dtype=dtype,
         )
 
     def quantize_route_logits(self, q_logits: Tensor) -> Tensor:
@@ -1614,11 +1654,19 @@ class _RouteNgramMemoryBase(nn.Module):
         )
         return "full" if estimated <= self.auto_max_kv_bytes else "streaming"
 
+    def _readout(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        """Dispatch the standard GQA readout; variants may replace this operation."""
+        return self._manual_gqa(query, key, value)
+
+    def _mix_head_output(self, head_output: Tensor) -> Tensor:
+        """Project GQA heads back to the hidden width."""
+        batch, time, _, _ = head_output.shape
+        return self.readout_o_proj(head_output.reshape(batch, time, self.readout_inner_dim))
+
     def _finish(
         self, head_output: Tensor, segment_ids: Optional[Tensor]
     ) -> Tensor:
-        batch, time, _, _ = head_output.shape
-        mixed = self.readout_o_proj(head_output.reshape(batch, time, self.readout_inner_dim))
+        mixed = self._mix_head_output(head_output)
         return mixed + self.short_conv(mixed, segment_ids=segment_ids)
 
     def forward(
@@ -1667,7 +1715,7 @@ class _RouteNgramMemoryBase(nn.Module):
                 valid_tokens,
             )
             key, value = self._project_memory(tokens)
-            head_output = self._manual_gqa(query, key, value)
+            head_output = self._readout(query, key, value)
         output = self._finish(head_output, segment_ids)
         if valid_tokens is not None:
             output = output * valid_tokens.unsqueeze(-1).to(output.dtype)
@@ -1794,7 +1842,7 @@ class _RouteNgramMemoryBase(nn.Module):
                 current_valid_tokens,
             )
             key, value = self._project_memory(route_tokens)
-            return self._manual_gqa(query, key, value)
+            return self._readout(query, key, value)
 
         batch, time, _, _ = query.shape
         query_grouped = query.view(
@@ -1947,9 +1995,7 @@ class _RouteNgramMemoryBase(nn.Module):
             values_are_q_logits,
             layout.local_valid_tokens,
         )
-        mixed = self.readout_o_proj(
-            head_output.reshape(batch, time, self.readout_inner_dim)
-        )
+        mixed = self._mix_head_output(head_output)
 
         conv = self.short_conv
         normalized = conv.norm(mixed)
@@ -2030,9 +2076,8 @@ class _RouteNgramMemoryBase(nn.Module):
 
     def _lookup_packed(self, packed: Tensor, state_length: int) -> Tensor:
         batch, routes = packed.shape
-        route_tokens = self.readout_kv_proj.weight.new_zeros(
-            batch, 1, routes, self.route_token_dim
-        )
+        table_weight = next(iter(self.tables.values())).weight
+        route_tokens = table_weight.new_zeros(batch, 1, routes, self.route_token_dim)
         for order_index, order in enumerate(self.ngrams):
             if state_length < order:
                 continue
@@ -2113,9 +2158,7 @@ class _RouteNgramMemoryBase(nn.Module):
             if state.route_state_length == 0 and state.route_history is None:
                 state_length = suffix_length
 
-        mixed = self.readout_o_proj(
-            head_output.reshape(batch, target_length, self.readout_inner_dim)
-        )
+        mixed = self._mix_head_output(head_output)
         conv, conv_history = self.short_conv.forward_incremental(
             mixed, state.conv_history
         )
@@ -2177,6 +2220,10 @@ class RouteNgramMemoryV2(_RouteNgramMemoryBase):
 
     def __init__(self, *args, sink_initial_active_mass: float = 0.5, **kwargs):
         super().__init__(*args, **kwargs)
+        self._initialize_sink(sink_initial_active_mass)
+
+    def _initialize_sink(self, sink_initial_active_mass: float) -> None:
+        """Initialize the optional zero-value sink for the standard V2 readout."""
         mass = float(sink_initial_active_mass)
         if not math.isfinite(mass) or not 0.0 < mass < 1.0:
             raise ValueError("sink_initial_active_mass must be finite and in (0, 1)")
@@ -2389,7 +2436,7 @@ class RouteNgramMemoryV2(_RouteNgramMemoryBase):
                 current_valid_tokens,
             )
             key, value = self._project_memory(route_tokens)
-            return self._manual_gqa(query, key, value)
+            return self._readout(query, key, value)
 
         batch, time, _, _ = query.shape
         query_grouped = query.view(
