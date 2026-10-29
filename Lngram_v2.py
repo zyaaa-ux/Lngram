@@ -33,6 +33,245 @@ def _normal_init(weight: Tensor, std: float) -> None:
     weight.copy_(temporary.to(weight.dtype))
 
 
+class LNGramBitBalance(nn.Module):
+    """Auxiliary-loss-free, per-bit quantile calibration for hard route addresses.
+
+    Each output bit uses an independent FP32 bias. For a full training step, the
+    global median of its raw router logits estimates the threshold that assigns
+    half of the valid tokens to each bit value. Biases are fixed throughout the
+    step and updated only after a successful optimizer step.
+
+    The caller must provide a process group covering data/context-parallel
+    replicas of the same layer when global balancing is required. Expert and
+    pipeline shards of different logical layers must not be mixed.
+
+    This component does not backpropagate through the bias or add an auxiliary
+    loss. The surrogate remains responsible for learning the router weights.
+    """
+
+    def __init__(
+        self,
+        width: int,
+        *,
+        bins: int = 1024,
+        initial_range: float = 8.0,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+        device=None,
+    ) -> None:
+        super().__init__()
+        if width < 1 or bins < 16 or not math.isfinite(initial_range) or initial_range <= 0:
+            raise ValueError("bit balance requires width>0, bins>=16, and a finite positive range")
+        self.width = int(width)
+        self.bins = int(bins)
+        self.group = group
+        self.register_buffer("bias", torch.zeros(width, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "histogram_range",
+            torch.full((width,), initial_range, dtype=torch.float32, device=device),
+        )
+        self.register_buffer("num_updates", torch.zeros(1, dtype=torch.int64, device=device))
+        # A diagnostic, not a necessary part of a training checkpoint.
+        self.register_buffer(
+            "last_median_bin_mass", torch.zeros(width, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self._collecting = False
+        self._generation = 0
+        self._histogram: Optional[Tensor] = None
+        self._max_abs: Optional[Tensor] = None
+        self.register_load_state_dict_pre_hook(self._load_legacy_state)
+
+    def _load_legacy_state(
+        self,
+        module: nn.Module,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list,
+        unexpected_keys: list,
+        error_msgs: list,
+    ) -> None:
+        """Accept a wholly absent balance state, but reject partial saved state."""
+        fields = ("bias", "histogram_range", "num_updates")
+        present = [field for field in fields if prefix + field in state_dict]
+        if not present:
+            for field in fields:
+                state_dict[prefix + field] = getattr(self, field).detach().clone()
+        elif len(present) != len(fields):
+            error_msgs.append(f"Incomplete bit balance state under {prefix!r}")
+
+    def _apply(self, fn, recurse=True):
+        # Calling model.half()/bfloat16() must not quantize calibration buffers.
+        def preserve_fp32(tensor: Tensor) -> Tensor:
+            moved = fn(tensor)
+            if tensor.is_floating_point() and moved.dtype != torch.float32:
+                return tensor.to(device=moved.device, dtype=torch.float32)
+            return moved
+
+        return super()._apply(preserve_fp32, recurse=recurse)
+
+    def hard_bits(self, logits: Tensor) -> Tensor:
+        """Use the same deterministic hard decision in training and inference."""
+        if logits.shape[-1] != self.width:
+            raise ValueError("bit balance logits width mismatch")
+        return logits.detach().float() + self.bias > 0
+
+    @torch.no_grad()
+    def begin_step(self) -> None:
+        """Start or restart a complete optimizer-step attempt."""
+        self._generation += 1
+        self._collecting = True
+        # 0: underflow, 1..bins: interior, bins+1: overflow, bins+2: nonfinite.
+        self._histogram = torch.zeros(
+            self.width, self.bins + 3, dtype=torch.int64, device=self.bias.device
+        )
+        self._max_abs = torch.zeros_like(self.bias)
+
+    @torch.no_grad()
+    def _local_histogram(
+        self, logits: Tensor, valid_tokens: Optional[Tensor]
+    ) -> Tuple[Tensor, Tensor]:
+        """Count all valid positions in bounded-size token chunks on device."""
+        if self._histogram is None:
+            raise RuntimeError("bit balance begin_step() was not called")
+        flat = logits.detach().reshape(-1, self.width)
+        valid = None if valid_tokens is None else valid_tokens.reshape(-1).bool()
+        hist = torch.zeros_like(self._histogram)
+        max_abs = torch.zeros_like(self.bias)
+        for start in range(0, flat.shape[0], 4096):
+            values = flat[start : start + 4096].float()
+            finite = torch.isfinite(values)
+            safe = torch.where(finite, values, 0.0)
+            position = ((safe / self.histogram_range + 1.0) * (self.bins / 2)).floor()
+            indices = (position.clamp(-1, self.bins).long() + 1).transpose(0, 1)
+            indices.masked_fill_(~finite.transpose(0, 1), self.bins + 2)
+            weights = torch.ones_like(indices)
+            if valid is not None:
+                token_valid = valid[start : start + values.shape[0]]
+                weights.mul_(token_valid.unsqueeze(0))
+                safe = safe * token_valid.unsqueeze(-1)
+            hist.scatter_add_(1, indices, weights)
+            max_abs = torch.maximum(max_abs, safe.abs().amax(dim=0))
+        return hist, max_abs
+
+    def observe_for_backward(
+        self, logits: Tensor, valid_tokens: Optional[Tensor] = None
+    ) -> Tensor:
+        """Return a per-call autograd alias that commits statistics on backward.
+
+        This prevents counting checkpoint forwards that never contribute to the
+        gradient. A recomputed checkpoint registers its own hook, which commits
+        once when the corresponding logits receive a gradient. Observation must
+        happen on CP-local logits, before any halo exchange.
+        """
+        if (
+            not self.training
+            or not self._collecting
+            or not torch.is_grad_enabled()
+            or not logits.requires_grad
+        ):
+            return logits
+        if logits.shape[-1] != self.width:
+            raise ValueError("bit balance logits width mismatch")
+        if valid_tokens is not None and tuple(valid_tokens.shape) != tuple(logits.shape[:-1]):
+            raise ValueError("valid_tokens must match all non-channel logit dimensions")
+        if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("bit balance statistics do not support CUDA graph capture")
+        histogram, max_abs = self._local_histogram(logits, valid_tokens)
+        generation = self._generation
+        committed = False
+
+        def commit(gradient: Tensor) -> Tensor:
+            nonlocal committed
+            if not committed:
+                if not self._collecting or generation != self._generation:
+                    raise RuntimeError("bit balance backward crossed an optimizer step")
+                assert self._histogram is not None and self._max_abs is not None
+                self._histogram.add_(histogram)
+                torch.maximum(self._max_abs, max_abs, out=self._max_abs)
+                committed = True
+            return gradient
+
+        # Register on a unique alias that is actually used by this forward.
+        # Registering on the caller's original tensor would count *all* its
+        # hooks if a second, unused forward reused the same tensor.
+        observed_logits = logits.view_as(logits)
+        observed_logits.register_hook(commit)
+        return observed_logits
+
+    @torch.no_grad()
+    def finish_step(self, successful: bool) -> None:
+        """Update next-step biases after a successful optimizer step only."""
+        if not self._collecting:
+            return
+        self._collecting = False
+        if not successful:
+            self._histogram = None
+            self._max_abs = None
+            return
+        assert self._histogram is not None and self._max_abs is not None
+        histogram, max_abs = self._histogram, self._max_abs
+        if self.group is not None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("bit balance process group requires initialized distributed")
+            if torch.distributed.get_world_size(self.group) > 1:
+                torch.distributed.all_reduce(histogram, group=self.group)
+                torch.distributed.all_reduce(
+                    max_abs, op=torch.distributed.ReduceOp.MAX, group=self.group
+                )
+        if bool(histogram[:, -1].any()):
+            raise RuntimeError("non-finite valid-token router logits in a successful step")
+        counts = histogram[:, :-1]
+        total = counts.sum(dim=-1)
+        cdf = counts.cumsum(dim=-1)
+        target = total.to(torch.float64) * 0.5
+        selected = (cdf >= target.unsqueeze(-1)).long().argmax(dim=-1)
+        count = counts.gather(1, selected.unsqueeze(-1)).squeeze(-1)
+        before = cdf.gather(1, selected.unsqueeze(-1)).squeeze(-1) - count
+        fraction = ((target - before) / count.clamp_min(1)).clamp(0.0, 1.0)
+        quantile = -self.histogram_range + (selected - 1 + fraction).float() * (
+            2.0 * self.histogram_range / self.bins
+        )
+        usable = (total > 0) & (selected > 0) & (selected <= self.bins)
+        self.bias.copy_(torch.where(usable, -quantile, self.bias))
+        self.last_median_bin_mass.copy_(
+            torch.where(usable, count.float() / total.clamp_min(1), 0.0)
+        )
+        # Range estimated from this step is used only to bin the following step.
+        self.histogram_range.copy_(
+            torch.where(total > 0, (max_abs * 1.01).clamp_min(1.0e-3), self.histogram_range)
+        )
+        self.num_updates.add_(usable.any().to(torch.int64))
+        self._histogram = None
+        self._max_abs = None
+
+
+def lngram_bit_balancers(model: nn.Module | Sequence[nn.Module]) -> Tuple[LNGramBitBalance, ...]:
+    """Find all balancing modules across model/pipeline chunks."""
+    chunks = (model,) if isinstance(model, nn.Module) else model
+    return tuple(
+        module
+        for chunk in chunks
+        for module in chunk.modules()
+        if isinstance(module, LNGramBitBalance)
+    )
+
+
+def begin_lngram_bit_balance_step(model: nn.Module | Sequence[nn.Module]) -> None:
+    """Begin one optimizer-step attempt before its forward/backward passes."""
+    for balancer in lngram_bit_balancers(model):
+        balancer.begin_step()
+
+
+def finish_lngram_bit_balance_step(
+    model: nn.Module | Sequence[nn.Module], *, successful: bool
+) -> None:
+    """Finalize after optimizer success, or discard statistics on a skipped step."""
+    for balancer in lngram_bit_balancers(model):
+        balancer.finish_step(successful=successful)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm with an FP32 fallback for older PyTorch versions."""
 
@@ -870,6 +1109,10 @@ class _RouteNgramMemoryBase(nn.Module):
         q_surrogate_temperature: float = 1.0,
         q_surrogate_scale: float = 1.0,
         dropout: float = 0.0,
+        bit_balance_enabled: bool = False,
+        bit_balance_bins: int = 1024,
+        bit_balance_initial_range: float = 8.0,
+        bit_balance_group: Optional[torch.distributed.ProcessGroup] = None,
         device=None,
         dtype=None,
     ):
@@ -912,6 +1155,17 @@ class _RouteNgramMemoryBase(nn.Module):
         self.alphabet_size = 1 << self.bits_per_route
         self.route_logits_dim = self.num_routes * self.bits_per_route
         self.route_token_dim = len(self.ngrams) * self.memory_dim
+        self.bit_balance = (
+            LNGramBitBalance(
+                self.route_logits_dim,
+                bins=bit_balance_bins,
+                initial_range=bit_balance_initial_range,
+                group=bit_balance_group,
+                device=device,
+            )
+            if bit_balance_enabled
+            else None
+        )
 
         self.readout_num_heads = int(readout_num_heads)
         self.readout_num_kv_heads = int(readout_num_kv_heads)
@@ -1010,11 +1264,20 @@ class _RouteNgramMemoryBase(nn.Module):
         )
 
     def quantize_route_logits(self, q_logits: Tensor) -> Tensor:
+        """Quantize raw logits with the current per-bit calibration bias."""
         if q_logits.shape[-1] != self.route_logits_dim:
             raise ValueError(
                 f"route logits dim={q_logits.shape[-1]}, expected {self.route_logits_dim}"
             )
-        return pack_bits_to_route_codes(q_logits > 0, self.bits_per_route)
+        bits = q_logits > 0 if self.bit_balance is None else self.bit_balance.hard_bits(q_logits)
+        return pack_bits_to_route_codes(bits, self.bits_per_route)
+
+    def set_bit_balance_process_group(
+        self, group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        """Attach the DP x CP group for this logical layer after distributed setup."""
+        if self.bit_balance is not None:
+            self.bit_balance.group = group
 
     def _use_surrogate(self, q_logits: Optional[Tensor]) -> bool:
         return bool(
@@ -1378,6 +1641,10 @@ class _RouteNgramMemoryBase(nn.Module):
             expected = (batch, time, self.route_logits_dim)
             if tuple(q_logits.shape) != expected:
                 raise ValueError(f"q_logits shape={tuple(q_logits.shape)}, expected {expected}")
+            if self.bit_balance is not None:
+                q_logits = self.bit_balance.observe_for_backward(q_logits, valid_tokens)
+                # Do not trust externally precomputed unbalanced route codes.
+                route_codes_btr = self.quantize_route_logits(q_logits)
             q_logits_btrm = q_logits.reshape(
                 batch, time, self.num_routes, self.bits_per_route
             )
@@ -1449,8 +1716,20 @@ class _RouteNgramMemoryBase(nn.Module):
                         dtype=torch.int32,
                     ),
                 )
+                if self.bit_balance is None:
+                    hard_windows = q_windows.detach() > 0
+                else:
+                    # Halo logits are raw; apply the same per-route thresholds
+                    # used for local tokens and non-CP execution.
+                    sliced_bias = self.bit_balance.bias.reshape(
+                        self.num_routes, self.bits_per_route
+                    )[route_start:route_end]
+                    hard_windows = (
+                        q_windows.detach().float()
+                        + sliced_bias.view(1, 1, 1, routes, self.bits_per_route)
+                    ) > 0
                 code_windows = torch.sum(
-                    (q_windows > 0).to(torch.int32)
+                    hard_windows.to(torch.int32)
                     * bit_weights.view(1, 1, 1, 1, -1),
                     dim=-1,
                     dtype=torch.int32,
@@ -1626,6 +1905,16 @@ class _RouteNgramMemoryBase(nn.Module):
         if tuple(route_codes_btr.shape) != (batch, time, self.num_routes):
             raise ValueError("route_codes_btr has an incompatible CP-local shape")
 
+        if q_logits is not None:
+            expected = (batch, time, self.route_logits_dim)
+            if tuple(q_logits.shape) != expected:
+                raise ValueError(f"q_logits shape must be {expected} for CP execution")
+            if self.bit_balance is not None:
+                # Count only CP-owned tokens; halo copies must not be counted.
+                q_logits = self.bit_balance.observe_for_backward(
+                    q_logits, layout.local_valid_tokens
+                )
+                route_codes_btr = self.quantize_route_logits(q_logits)
         use_surrogate = self._use_surrogate(q_logits)
         route_lags = tuple(range(1, self.max_ngram_order))
         route_plan = layout.plan(route_lags)
@@ -1765,13 +2054,25 @@ class _RouteNgramMemoryBase(nn.Module):
         hidden_states: Tensor,
         route_codes_btr: Tensor,
         state: Optional[LngramIncrementalState] = None,
+        *,
+        q_logits: Optional[Tensor] = None,
     ) -> Tuple[Tensor, LngramIncrementalState]:
-        """Exact prompt/decode execution.  Surrogate gradients are training-only."""
+        """Exact cached inference with optional raw-logit re-quantization.
+
+        Pass q_logits to apply the current bias inside this call, or provide
+        route_codes_btr produced by quantize_route_logits(). Cached route codes
+        are addresses, so the balance bias must remain fixed during a request.
+        """
         if self.training:
             raise RuntimeError("forward_incremental is inference-only; call eval() first")
         if state is None:
             state = LngramIncrementalState()
         batch, target_length, _ = hidden_states.shape
+        if q_logits is not None:
+            expected = (batch, target_length, self.route_logits_dim)
+            if tuple(q_logits.shape) != expected:
+                raise ValueError(f"incremental q_logits shape must be {expected}")
+            route_codes_btr = self.quantize_route_logits(q_logits)
         if tuple(route_codes_btr.shape) != (batch, target_length, self.num_routes):
             raise ValueError("incremental route code shape mismatch")
         query = self._project_query(hidden_states)
@@ -2183,4 +2484,8 @@ __all__ = [
     "LngramContextParallelLayout",
     "estimate_lngram_v2_parameters_per_layer",
     "estimate_lngram_parameters_per_layer",
+    "LNGramBitBalance",
+    "lngram_bit_balancers",
+    "begin_lngram_bit_balance_step",
+    "finish_lngram_bit_balance_step",
 ]
