@@ -1363,6 +1363,10 @@ class _RouteNgramMemoryBase(nn.Module):
             None if q_logits_btrm is None else q_logits_btrm[:, :, route_start:route_end, :]
         )
         use_surrogate = self._use_surrogate(q_logits_btrm)
+        if use_surrogate and self.bit_balance is not None:
+            q_chunk = q_chunk.float() + self.bit_balance.bias.detach().reshape(
+                self.num_routes, self.bits_per_route
+            )[route_start:route_end]
         memories = []
         for order in self.ngrams:
             valid_mask = self._valid_mask(
@@ -1807,6 +1811,10 @@ class _RouteNgramMemoryBase(nn.Module):
             memory = self.tables[f"ngram_{order}"](offsets + address)
             memory = memory * valid_mask.unsqueeze(-1).unsqueeze(-1).to(memory.dtype)
             if q_windows is not None:
+                if self.bit_balance is not None:
+                    q_windows = q_windows.float() + self.bit_balance.bias.detach().reshape(
+                        self.num_routes, self.bits_per_route
+                    )[route_start:route_end]
                 memory = _LngramWindowSurrogate.apply(
                     memory,
                     q_windows,
