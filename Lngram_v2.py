@@ -2530,11 +2530,121 @@ class RouteNgramMemoryV2(_RouteNgramMemoryBase):
             batch, time, self.readout_num_heads, self.readout_head_dim
         )
 
+class RouteNgramMemoryV2Linear(_RouteNgramMemoryBase):
+    """Dense V2L readout with a full-width or per-head sigmoid gate.
+
+    ``readout_mode="scalar"`` gates the entire projected value with one score.
+    ``readout_mode="per_head"`` splits the projected channels into heads of
+    width ``memory_dim``. The dense projections mix all routes and n-gram
+    orders before the split, so heads are groups of output channels.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        bits_per_route: int = 4,
+        num_routes: int = 16,
+        memory_dim: int = 128,
+        ngrams: Sequence[int] = (2, 3),
+        *,
+        readout_mode: str = "scalar",
+        table_init_std_scale: float = 1.0,
+        execution_mode: str = "full",
+        readout_checkpoint_streaming: bool = False,
+        **kwargs,
+    ):
+        if readout_mode not in {"scalar", "per_head"}:
+            raise ValueError("V2L readout_mode must be scalar or per_head")
+        if str(execution_mode).lower() not in {"full", "auto"} or readout_checkpoint_streaming:
+            raise ValueError("V2L requires full lookup; route-streaming readout is GQA-only")
+        self.readout_mode = readout_mode
+        super().__init__(
+            hidden_size,
+            bits_per_route,
+            num_routes,
+            memory_dim,
+            ngrams,
+            table_init_std_scale=table_init_std_scale,
+            execution_mode="full",
+            **kwargs,
+        )
+
+    def _initialize_readout_layout(self, *, readout_attention_dropout: float, **_gqa_layout):
+        width = self.num_routes * self.route_token_dim
+        if width != self.hidden_size:
+            raise ValueError(
+                f"V2L requires num_routes * len(ngrams) * memory_dim == hidden_size; "
+                f"got {width} != {self.hidden_size}"
+            )
+        if readout_attention_dropout:
+            raise ValueError("V2L does not use attention dropout; use lookup dropout if needed")
+        self.readout_head_dim = (
+            self.memory_dim if self.readout_mode == "per_head" else self.hidden_size
+        )
+        self.readout_num_heads = self.hidden_size // self.readout_head_dim
+        self.readout_gate_scale = self.readout_head_dim ** -0.5
+
+    def _initialize_readout_modules(
+        self,
+        *,
+        normalization: str,
+        rmsnorm_eps: float,
+        initializer_range: float,
+        readout_kv_proj_init_std_scale: float,
+        device,
+        dtype,
+        **_gqa_init,
+    ) -> None:
+        self.readout_query_norm = build_lngram_norm(
+            normalization, self.hidden_size, rmsnorm_eps, device=device, dtype=dtype
+        )
+        self.readout_key_norm = build_lngram_norm(
+            normalization, self.hidden_size, rmsnorm_eps, device=device, dtype=dtype
+        )
+        self.readout_key_proj = nn.Linear(
+            self.hidden_size, self.hidden_size, bias=False, device=device, dtype=dtype
+        )
+        self.readout_value_proj = nn.Linear(
+            self.hidden_size, self.hidden_size, bias=False, device=device, dtype=dtype
+        )
+        _normal_init(
+            self.readout_key_proj.weight, initializer_range * readout_kv_proj_init_std_scale
+        )
+        # Keep the initial residual zero while allowing the value projection to learn.
+        _normal_init(self.readout_value_proj.weight, 0.0)
+
+    def _project_query(self, hidden_states: Tensor) -> Tensor:
+        query = self.readout_query_norm(hidden_states)
+        return query.unflatten(-1, (self.readout_num_heads, self.readout_head_dim))
+
+    def _project_memory(self, route_tokens: Tensor) -> Tuple[Tensor, Tensor]:
+        memory = route_tokens.flatten(-2)
+        key = self.readout_key_norm(self.readout_key_proj(memory))
+        value = self.readout_value_proj(memory)
+        head_shape = (self.readout_num_heads, self.readout_head_dim)
+        return key.unflatten(-1, head_shape), value.unflatten(-1, head_shape)
+
+    def _readout(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        # Normalize Q/K across the full width before splitting. Only the
+        # dot-product reduction and its scale depend on the head layout.
+        score = (query.float() * key.float()).sum(dim=-1, keepdim=True)
+        score = score * self.readout_gate_scale
+        score = score.sign() * score.abs().clamp_min(1e-6).sqrt()
+        return score.sigmoid().to(value.dtype) * value
+
+    def _mix_head_output(self, head_output: Tensor) -> Tensor:
+        return head_output.flatten(-2)
+
+    def _incremental_head_output(self, query: Tensor, route_tokens: Tensor) -> Tensor:
+        return self._readout(query, *self._project_memory(route_tokens))
+
+
 # Compatibility alias for integrations that used the earlier helper name.
 estimate_lngram_parameters_per_layer = estimate_lngram_v2_parameters_per_layer
 
 __all__ = [
     "RouteNgramMemoryV2",
+    "RouteNgramMemoryV2Linear",
     "LngramIncrementalState",
     "LngramContextParallelLayout",
     "estimate_lngram_v2_parameters_per_layer",
