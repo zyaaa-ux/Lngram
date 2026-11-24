@@ -2534,9 +2534,10 @@ class RouteNgramMemoryV2Linear(_RouteNgramMemoryBase):
     """Dense V2L readout with a full-width or per-head sigmoid gate.
 
     ``readout_mode="scalar"`` gates the entire projected value with one score.
-    ``readout_mode="per_head"`` splits the projected channels into heads of
-    width ``memory_dim``. The dense projections mix all routes and n-gram
-    orders before the split, so heads are groups of output channels.
+    ``readout_mode="per_head"`` projects the hidden state with a learned
+    query matrix, then splits Q, K, and V into heads of width ``memory_dim``.
+    The dense memory projections mix all routes and n-gram orders before
+    the split. A dense output projection mixes the concatenated gated heads.
     """
 
     def __init__(
@@ -2590,11 +2591,20 @@ class RouteNgramMemoryV2Linear(_RouteNgramMemoryBase):
         normalization: str,
         rmsnorm_eps: float,
         initializer_range: float,
+        output_proj_init_std_scale: float,
+        readout_q_proj_init_std_scale: float,
         readout_kv_proj_init_std_scale: float,
         device,
         dtype,
         **_gqa_init,
     ) -> None:
+        if self.readout_mode == "per_head":
+            self.readout_q_proj = nn.Linear(
+                self.hidden_size, self.hidden_size, bias=False, device=device, dtype=dtype
+            )
+            _normal_init(
+                self.readout_q_proj.weight, initializer_range * readout_q_proj_init_std_scale
+            )
         self.readout_query_norm = build_lngram_norm(
             normalization, self.hidden_size, rmsnorm_eps, device=device, dtype=dtype
         )
@@ -2610,11 +2620,23 @@ class RouteNgramMemoryV2Linear(_RouteNgramMemoryBase):
         _normal_init(
             self.readout_key_proj.weight, initializer_range * readout_kv_proj_init_std_scale
         )
+        if self.readout_mode == "per_head":
+            self.readout_o_proj = nn.Linear(
+                self.hidden_size, self.hidden_size, bias=False, device=device, dtype=dtype
+            )
+            _normal_init(
+                self.readout_o_proj.weight, initializer_range * output_proj_init_std_scale
+            )
         # Keep the initial residual zero while allowing the value projection to learn.
         _normal_init(self.readout_value_proj.weight, 0.0)
 
     def _project_query(self, hidden_states: Tensor) -> Tensor:
-        query = self.readout_query_norm(hidden_states)
+        query = (
+            self.readout_q_proj(hidden_states)
+            if self.readout_mode == "per_head"
+            else hidden_states
+        )
+        query = self.readout_query_norm(query)
         return query.unflatten(-1, (self.readout_num_heads, self.readout_head_dim))
 
     def _project_memory(self, route_tokens: Tensor) -> Tuple[Tensor, Tensor]:
@@ -2625,15 +2647,18 @@ class RouteNgramMemoryV2Linear(_RouteNgramMemoryBase):
         return key.unflatten(-1, head_shape), value.unflatten(-1, head_shape)
 
     def _readout(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        # Normalize Q/K across the full width before splitting. Only the
-        # dot-product reduction and its scale depend on the head layout.
+        # The Q/K projections and norms operate at full width. Each head
+        # then has its own dot product scaled by the square root of its width.
         score = (query.float() * key.float()).sum(dim=-1, keepdim=True)
         score = score * self.readout_gate_scale
         score = score.sign() * score.abs().clamp_min(1e-6).sqrt()
         return score.sigmoid().to(value.dtype) * value
 
     def _mix_head_output(self, head_output: Tensor) -> Tensor:
-        return head_output.flatten(-2)
+        combined = head_output.flatten(-2)
+        if self.readout_mode == "per_head":
+            combined = self.readout_o_proj(combined)
+        return combined
 
     def _incremental_head_output(self, query: Tensor, route_tokens: Tensor) -> Tensor:
         return self._readout(query, *self._project_memory(route_tokens))
